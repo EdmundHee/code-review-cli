@@ -25,7 +25,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .config import Config
-from .events import ConfigReloaded, CycleStarted, DeepSeekDone, EventBus, LogLine, PrOutcome, RepoListed
+from .events import AgentEvent, ConfigReloaded, CycleStarted, DeepSeekDone, EventBus, LogLine, PrOutcome, RepoListed
 from .github import GhClient
 from .models import ACTION_SKIP_SEEN
 from .poller import baseline_if_first_run, preflight
@@ -84,6 +84,9 @@ class DashboardState:
         self.cost_rows: deque = deque(maxlen=50)
         self.events: deque = deque(maxlen=200)
         self.spent_24h = 0.0
+        # Live sub-agents (lenses + scorers) for the PR currently under review.
+        self.agents_pr: tuple | None = None
+        self.agents: dict[str, dict] = {}
 
     # -- seeding (main thread, before the worker starts) -----------------
     def seed(self, rows, spent_24h: float) -> None:
@@ -122,6 +125,14 @@ def reduce(state: DashboardState, evt: object) -> None:
         if evt.repo not in state.repos:
             state.repos[evt.repo] = {"open_prs": None, "last": "—"}
         state.repos[evt.repo]["open_prs"] = evt.open_prs
+    elif isinstance(evt, AgentEvent):
+        key = (evt.repo, evt.pr_number)
+        if key != state.agents_pr:  # a new PR started → reset the agent board
+            state.agents_pr = key
+            state.agents = {}
+        state.agents[evt.agent] = {"status": evt.status, "detail": evt.detail}
+        if evt.status == "failed":  # surface failures in the history log too
+            state.events.append(f"{_hhmmss(_utcnow())} {evt.repo}#{evt.pr_number} {evt.agent} failed: {evt.detail}")
     elif isinstance(evt, DeepSeekDone):
         state.latest = evt
         state.events.append(
@@ -193,6 +204,35 @@ def _deepseek(state: DashboardState) -> Panel:
     return Panel(body, title="DEEPSEEK RESPONSE (latest)", border_style="green", title_align="left")
 
 
+_AGENT_GLYPH = {"running": "⠿", "done": "✓", "failed": "✗"}
+_AGENT_STYLE = {"running": "yellow", "done": "green", "failed": "red"}
+
+
+def _agents(state: DashboardState) -> Panel:
+    title = "AGENTS"
+    if state.agents_pr:
+        repo, num = state.agents_pr
+        title += f" · {repo.split('/')[-1]}#{num}"
+    if not state.agents:
+        return Panel(Text("no active agents", style="dim italic"), title=title, border_style="magenta", title_align="left")
+    t = Table.grid(padding=(0, 1), expand=True)
+    t.add_column(no_wrap=True)
+    t.add_column(no_wrap=True)
+    t.add_column(ratio=1, overflow="ellipsis")
+    for agent, st in state.agents.items():
+        status = st["status"]
+        t.add_row(
+            Text(_AGENT_GLYPH.get(status, "·"), style=_AGENT_STYLE.get(status, "")),
+            Text(agent, style="bold" if status == "running" else ""),
+            Text(st["detail"], style="dim"),
+        )
+    done = sum(1 for s in state.agents.values() if s["status"] == "done")
+    return Panel(
+        t, title=title, border_style="magenta", title_align="left",
+        subtitle=f"{done}/{len(state.agents)} done", subtitle_align="right",
+    )
+
+
 def _cost(state: DashboardState) -> Panel:
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(no_wrap=True)
@@ -216,12 +256,16 @@ def _history(state: DashboardState) -> Panel:
 def build_layout(state: DashboardState) -> Layout:
     with state.lock:
         header = _header(state)
-        mon, ds, cost, hist = _monitoring(state), _deepseek(state), _cost(state), _history(state)
+        mon, ds, agents, cost, hist = (
+            _monitoring(state), _deepseek(state), _agents(state), _cost(state), _history(state)
+        )
     layout = Layout()
     layout.split_column(Layout(header, name="header", size=3), Layout(name="body"))
     layout["body"].split_row(Layout(name="left"), Layout(name="right"))
     layout["left"].split_column(Layout(mon, name="monitoring"), Layout(cost, name="cost"))
-    layout["right"].split_column(Layout(ds, name="deepseek"), Layout(hist, name="history"))
+    layout["right"].split_column(
+        Layout(ds, name="deepseek"), Layout(agents, name="agents"), Layout(hist, name="history")
+    )
     return layout
 
 

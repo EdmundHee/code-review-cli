@@ -72,6 +72,51 @@ def test_bad_behavior_rejected(tmp_path):
         load_config(_write(tmp_path, bad), env={}, resolve_secrets=False)
 
 
+# -- review section ----------------------------------------------------------
+
+def test_review_defaults_to_multi(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID), env={}, resolve_secrets=False)
+    assert cfg.review.mode == "multi"
+    assert cfg.review.confidence_threshold == 80
+    assert cfg.review.scoring_votes == 1
+    assert set(cfg.review.lenses) == {"correctness", "security", "maintainability", "test_coverage"}
+    assert cfg.diff.test_globs  # defaults applied
+
+
+def test_review_parsed_and_clamped(tmp_path):
+    text = VALID + (
+        "review:\n"
+        "  mode: multi\n"
+        "  confidence_threshold: 250\n"
+        "  scoring_votes: 3\n"
+        "  lenses:\n"
+        "    - correctness\n"
+        "    - security\n"
+    )
+    cfg = load_config(_write(tmp_path, text), env={}, resolve_secrets=False)
+    assert cfg.review.confidence_threshold == 100  # clamped
+    assert cfg.review.scoring_votes == 3
+    assert cfg.review.lenses == ("correctness", "security")
+
+
+def test_review_rejects_bad_mode(tmp_path):
+    text = VALID + "review:\n  mode: turbo\n"
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, text), env={}, resolve_secrets=False)
+
+
+def test_review_rejects_unknown_lens(tmp_path):
+    text = VALID + "review:\n  lenses:\n    - vibes\n"
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, text), env={}, resolve_secrets=False)
+
+
+def test_review_rejects_zero_votes(tmp_path):
+    text = VALID + "review:\n  scoring_votes: 0\n"
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, text), env={}, resolve_secrets=False)
+
+
 # -- merge_reloadable (hot-reload) -------------------------------------------
 
 def test_merge_swaps_safe_fields_no_restart(tmp_path):
@@ -82,10 +127,12 @@ def test_merge_swaps_safe_fields_no_restart(tmp_path):
         poll_interval_seconds=300,
         budgets=dataclasses.replace(old.budgets, daily_usd_budget=10.0),
     )
+    new = dataclasses.replace(new, review=dataclasses.replace(old.review, confidence_threshold=90))
     merged, restart = merge_reloadable(old, new)
     assert merged.repos == ("owner/repo", "owner/added")
     assert merged.poll_interval_seconds == 300
     assert merged.budgets.daily_usd_budget == 10.0
+    assert merged.review.confidence_threshold == 90  # review is hot-reloadable
     assert restart == []
 
 

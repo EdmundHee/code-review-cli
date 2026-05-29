@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import threading
+
 from ghcr.config import (
     BudgetConfig,
     Config,
     DeepSeekConfig,
     DiffConfig,
     GithubConfig,
+    ReviewModeConfig,
     ReviewPolicy,
 )
+from ghcr.prompts import LENS_NAMES
 from ghcr.cost import Prices
 from ghcr.github import GhError
 from ghcr.models import PullRequest, ReviewResult, Usage
@@ -31,6 +35,12 @@ def make_config(
     budget_exceeded_behavior: str = "notice",
     skip_globs=DEFAULT_SKIP,
     model: str = "deepseek-v4-pro",
+    review_mode: str = "single",
+    lenses=LENS_NAMES,
+    confidence_threshold: int = 80,
+    scoring_votes: int = 1,
+    max_parallel: int = 0,
+    test_globs=("**/test_*.py", "**/tests/**"),
 ) -> Config:
     return Config(
         github=GithubConfig(gh_path="/usr/bin/true", token="t", bot_login=bot_login, request_timeout_seconds=60),
@@ -51,8 +61,16 @@ def make_config(
             per_run_input_token_cap=per_run_input_token_cap,
             skip_globs=tuple(skip_globs),
             oversized_behavior=oversized_behavior,
+            test_globs=tuple(test_globs),
         ),
         budgets=BudgetConfig(daily_usd_budget=daily_usd_budget, budget_exceeded_behavior=budget_exceeded_behavior),
+        review=ReviewModeConfig(
+            mode=review_mode,
+            lenses=tuple(lenses),
+            confidence_threshold=confidence_threshold,
+            scoring_votes=scoring_votes,
+            max_parallel=max_parallel,
+        ),
         db_path=db_path,
         log_level="INFO",
     )
@@ -94,16 +112,40 @@ class FakeGhClient:
 
 
 class FakeDeepSeekClient:
-    def __init__(self, *, content="## Summary\nlooks fine", usage=None, raises=False):
+    """Routes a canned response by matching a substring of the system prompt.
+
+    ``responses`` maps a substring (e.g. "## LENS: security" or "## PASS: scoring")
+    to either a string or a ``callable(system, user) -> str`` (so scoring can vary
+    by the finding embedded in the user prompt). Unmatched calls fall back to
+    ``content`` — keeping single-pass tests unchanged. The call counter and seen
+    log are lock-guarded because the multi-pass pipeline calls from a thread pool.
+    """
+
+    def __init__(self, *, content="## Summary\nlooks fine", usage=None, raises=False, responses=None):
         self.content = content
         self.usage = usage or Usage(prompt_tokens=1000, completion_tokens=500, total_tokens=1500)
         self.raises = raises
+        self.responses = responses or {}
+        self._lock = threading.Lock()
         self.calls = 0
+        self.systems: list[str] = []
 
     def review(self, system_prompt, user_prompt):
-        self.calls += 1
+        with self._lock:
+            self.calls += 1
+            self.systems.append(system_prompt)
         if self.raises:
             from ghcr.deepseek import DeepSeekError
 
             raise DeepSeekError("api down")
-        return ReviewResult(content=self.content, usage=self.usage, model="deepseek-v4-pro")
+        return ReviewResult(content=self._route(system_prompt, user_prompt), usage=self.usage, model="deepseek-v4-pro")
+
+    def _route(self, system_prompt, user_prompt):
+        for key, val in self.responses.items():
+            if key in system_prompt:
+                return val(system_prompt, user_prompt) if callable(val) else val
+        return self.content
+
+    def calls_matching(self, substr: str) -> int:
+        with self._lock:
+            return sum(1 for s in self.systems if substr in s)
