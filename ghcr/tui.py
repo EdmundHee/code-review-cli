@@ -25,7 +25,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .config import Config
-from .events import CycleStarted, DeepSeekDone, EventBus, LogLine, PrOutcome, RepoListed
+from .events import ConfigReloaded, CycleStarted, DeepSeekDone, EventBus, LogLine, PrOutcome, RepoListed
 from .github import GhClient
 from .poller import baseline_if_first_run, preflight
 from .state import StateStore
@@ -96,6 +96,14 @@ def reduce(state: DashboardState, evt: object) -> None:
     if isinstance(evt, CycleStarted):
         state.interval_s = evt.interval_s
         state.events.append(f"{_hhmmss(_utcnow())} cycle: {evt.repo_count} repo(s) every {evt.interval_s}s")
+    elif isinstance(evt, ConfigReloaded):
+        state.interval_s = evt.interval_s
+        state.budget = evt.budget
+        for repo in evt.repos:  # add newly-configured repos
+            state.repos.setdefault(repo, {"open_prs": None, "last": "—"})
+        for repo in [r for r in state.repos if r not in evt.repos]:  # drop removed ones
+            del state.repos[repo]
+        state.events.append(f"{_hhmmss(_utcnow())} config reloaded: {len(evt.repos)} repo(s)")
     elif isinstance(evt, RepoListed):
         if evt.repo not in state.repos:
             state.repos[evt.repo] = {"open_prs": None, "last": "—"}
@@ -236,7 +244,7 @@ def _reconfigure_logging(cfg: Config, bus: EventBus) -> None:
 
 # -- entrypoint ---------------------------------------------------------------
 
-def run_tui(cfg: Config) -> int:
+def run_tui(cfg: Config, config_path: str | None = None) -> int:
     from .cli import _build  # lazy: avoid import cycle (cli imports tui in cmd_tui)
 
     bus = EventBus()
@@ -262,7 +270,7 @@ def run_tui(cfg: Config) -> int:
         w_gh, _ds, store, orch = _build(cfg, bus=bus)
         baseline_if_first_run(w_gh, store, cfg)
         from .poller import PollLoop
-        loop = PollLoop(orch, w_gh, cfg, bus=bus)
+        loop = PollLoop(orch, w_gh, cfg, bus=bus, config_path=config_path)
         holder["loop"] = loop
         loop.run_forever(install_signals=False)
 

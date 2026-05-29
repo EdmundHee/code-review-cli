@@ -1,4 +1,4 @@
-from ghcr.events import CycleStarted, DeepSeekDone, LogLine, PrOutcome, RepoListed
+from ghcr.events import ConfigReloaded, CycleStarted, DeepSeekDone, LogLine, PrOutcome, RepoListed
 from ghcr.tui import DashboardState, build_layout
 from tests.fakes import make_config
 
@@ -43,6 +43,23 @@ def test_pr_outcome_transient_skip_no_cost_row(tmp_path):
     state.apply(PrOutcome(repo="owner/repo", pr_number=5, action="skip_draft", cost_usd=0.0))
     assert len(state.cost_rows) == 0
     assert state.spent_24h == 0.0
+
+
+def test_config_reloaded_adds_new_and_prunes_removed_repos(tmp_path):
+    state, _ = _state(tmp_path)  # starts with "owner/repo"
+    state.apply(ConfigReloaded(repos=("owner/repo", "owner/added"), interval_s=300, budget=9.0))
+    assert "owner/added" in state.repos
+    assert "owner/repo" in state.repos
+    assert state.interval_s == 300
+    assert state.budget == 9.0
+    assert any("reload" in e.lower() for e in state.events)
+
+
+def test_config_reloaded_removes_dropped_repo(tmp_path):
+    state, _ = _state(tmp_path)  # starts with "owner/repo"
+    state.apply(ConfigReloaded(repos=("owner/added",), interval_s=120, budget=5.0))
+    assert "owner/repo" not in state.repos
+    assert "owner/added" in state.repos
 
 
 def test_log_line_appended_to_history(tmp_path):

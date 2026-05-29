@@ -47,6 +47,13 @@ class PrOutcome:
 
 
 @dataclass(frozen=True)
+class ConfigReloaded:
+    repos: tuple[str, ...]
+    interval_s: int
+    budget: float
+
+
+@dataclass(frozen=True)
 class LogLine:
     ts: str
     level: str

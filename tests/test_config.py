@@ -1,6 +1,9 @@
+import dataclasses
+
 import pytest
 
-from ghcr.config import ConfigError, load_config
+from ghcr.config import ConfigError, load_config, merge_reloadable
+from tests.fakes import make_config
 
 VALID = """\
 github:
@@ -67,3 +70,35 @@ def test_bad_behavior_rejected(tmp_path):
     bad = VALID.replace("oversized_behavior: notice", "oversized_behavior: explode")
     with pytest.raises(ConfigError):
         load_config(_write(tmp_path, bad), env={}, resolve_secrets=False)
+
+
+# -- merge_reloadable (hot-reload) -------------------------------------------
+
+def test_merge_swaps_safe_fields_no_restart(tmp_path):
+    old = make_config(db_path=str(tmp_path / "db"))
+    new = dataclasses.replace(
+        old,
+        repos=("owner/repo", "owner/added"),
+        poll_interval_seconds=300,
+        budgets=dataclasses.replace(old.budgets, daily_usd_budget=10.0),
+    )
+    merged, restart = merge_reloadable(old, new)
+    assert merged.repos == ("owner/repo", "owner/added")
+    assert merged.poll_interval_seconds == 300
+    assert merged.budgets.daily_usd_budget == 10.0
+    assert restart == []
+
+
+def test_merge_preserves_restart_only_fields(tmp_path):
+    old = make_config(db_path=str(tmp_path / "db"), bot_login="reviewbot", model="deepseek-v4-pro")
+    new = make_config(db_path=str(tmp_path / "other"), bot_login="otherbot", model="deepseek-v5")
+    new = dataclasses.replace(new, repos=("owner/added",))
+    merged, restart = merge_reloadable(old, new)
+    # safe field applied
+    assert merged.repos == ("owner/added",)
+    # restart-only fields kept from old
+    assert merged.github.bot_login == "reviewbot"
+    assert merged.deepseek.model == "deepseek-v4-pro"
+    assert merged.db_path == str(tmp_path / "db")
+    # and reported
+    assert set(restart) == {"github", "deepseek", "db_path"}
