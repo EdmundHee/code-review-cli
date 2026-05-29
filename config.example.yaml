@@ -19,11 +19,10 @@ deepseek:
     output_per_1m: 3.48               # post-promo rate (promo ended 2026-05-31)
 
 repos:
-  - owner/repo-one
-  # - owner/repo-two
+   - owner/repo-two
 
 poll:
-  interval_seconds: 120
+  interval_seconds: 180
 
 review_policy:
   skip_drafts: true
