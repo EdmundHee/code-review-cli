@@ -95,9 +95,11 @@ class Config:
 
 
 # Fields safe to swap into a running loop (read fresh every cycle/PR). The rest
-# (github/deepseek/db_path) bind a constructed client or store and need a restart.
+# bind something at startup that a live swap won't touch: github/deepseek/db_path
+# construct a client or store, and log_level is applied once via logging.basicConfig
+# (nothing re-runs setLevel on reload), so all of them need a restart to take effect.
 _RELOADABLE = ("repos", "poll_interval_seconds", "review_policy", "diff", "budgets")
-_RESTART_ONLY = ("github", "deepseek", "db_path")
+_RESTART_ONLY = ("github", "deepseek", "db_path", "log_level")
 
 
 def merge_reloadable(old: Config, new: Config) -> tuple[Config, list[str]]:

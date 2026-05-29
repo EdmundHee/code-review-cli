@@ -45,6 +45,19 @@ def test_pr_outcome_transient_skip_no_cost_row(tmp_path):
     assert state.spent_24h == 0.0
 
 
+def test_skip_seen_does_not_clobber_recorded_review(tmp_path):
+    state, _ = _state(tmp_path)
+    state.apply(PrOutcome(repo="owner/repo", pr_number=2, action="review", cost_usd=0.018))
+    before = len(state.events)
+    # A later cycle re-emits skip_seen for the same already-reviewed PR.
+    state.apply(PrOutcome(repo="owner/repo", pr_number=2, action="skip_seen", cost_usd=0.0))
+    # The review line and cost survive; skip_seen adds no event noise.
+    assert state.repos["owner/repo"]["last"].startswith("#2 review")
+    assert state.spent_24h == 0.018
+    assert len(state.cost_rows) == 1
+    assert len(state.events) == before
+
+
 def test_config_reloaded_adds_new_and_prunes_removed_repos(tmp_path):
     state, _ = _state(tmp_path)  # starts with "owner/repo"
     state.apply(ConfigReloaded(repos=("owner/repo", "owner/added"), interval_s=300, budget=9.0))

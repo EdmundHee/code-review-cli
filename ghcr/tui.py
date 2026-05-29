@@ -27,6 +27,7 @@ from rich.text import Text
 from .config import Config
 from .events import ConfigReloaded, CycleStarted, DeepSeekDone, EventBus, LogLine, PrOutcome, RepoListed
 from .github import GhClient
+from .models import ACTION_SKIP_SEEN
 from .poller import baseline_if_first_run, preflight
 from .state import StateStore
 
@@ -117,6 +118,12 @@ def reduce(state: DashboardState, evt: object) -> None:
     elif isinstance(evt, PrOutcome):
         if evt.repo not in state.repos:
             state.repos[evt.repo] = {"open_prs": None, "last": "—"}
+        # skip_seen fires every poll cycle for any already-reviewed PR and writes
+        # no DB row — it carries no new info. Letting it through would clobber the
+        # recorded review line ("#2 review $0.018") with "#2 skip_seen $0.0000" and
+        # spam the event log every interval. Drop it; the review stays on display.
+        if evt.action == ACTION_SKIP_SEEN:
+            return
         mark = "✓" if evt.action in _REVIEW_OUTCOMES else evt.action
         state.repos[evt.repo]["last"] = f"#{evt.pr_number} {evt.action} ${evt.cost_usd:.4f}"
         if evt.action in _REVIEW_OUTCOMES or evt.cost_usd > 0:
