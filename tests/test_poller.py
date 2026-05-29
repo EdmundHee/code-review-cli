@@ -2,8 +2,10 @@ import dataclasses
 
 import pytest
 
-from ghcr.events import ConfigReloaded, EventBus
+from ghcr.events import ConfigReloaded, EventBus, RepoDone, RepoListed
+from ghcr.models import ACTION_SKIP_SEEN
 from ghcr.poller import PollLoop, baseline_if_first_run, preflight
+from ghcr.review import ReviewOutcome
 from ghcr.state import StateStore
 from tests.fakes import FakeGhClient, make_config, make_pr
 
@@ -127,3 +129,25 @@ def test_run_once_applies_pending_before_iterating(tmp_path):
     loop.set_pending_config(dataclasses.replace(old, repos=("owner/new1", "owner/new2")))
     loop.run_once()
     assert listed == ["owner/new1", "owner/new2"]
+
+
+class _SkipSeenOrch(_Orch):
+    """Orchestrator whose every PR is already-seen — proves a repo with only
+    skip_seen PRs still emits RepoDone (its freshness must update)."""
+
+    def review_pr(self, pr):
+        return ReviewOutcome(ACTION_SKIP_SEEN)
+
+
+def test_run_once_emits_repo_done_per_repo_including_skip_seen(tmp_path):
+    cfg = dataclasses.replace(make_config(db_path=str(tmp_path / "db")), repos=("owner/a", "owner/b"))
+    bus = EventBus()
+    seen: list = []
+    bus.subscribe(seen.append)
+    gh = FakeGhClient(prs=[make_pr(number=1), make_pr(number=2)])  # both skip_seen
+    loop = PollLoop(_SkipSeenOrch(cfg), gh, cfg, bus=bus)
+    loop.run_once()
+    listed = {e.repo for e in seen if isinstance(e, RepoListed)}
+    done = {e.repo for e in seen if isinstance(e, RepoDone)}
+    assert listed == {"owner/a", "owner/b"}
+    assert done == {"owner/a", "owner/b"}  # RepoDone fires despite skip_seen-only PRs

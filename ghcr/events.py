@@ -26,6 +26,18 @@ class RepoListed:
 
 
 @dataclass(frozen=True)
+class RepoDone:
+    """A repo finished its poll this cycle (PRs reviewed/skipped, or list failed).
+
+    Marks the end boundary of working a repo so the TUI can clear the active
+    highlight and stamp "last polled" freshness. Carries no duration — the TUI
+    computes time-since-poll from when this arrives.
+    """
+
+    repo: str
+
+
+@dataclass(frozen=True)
 class DeepSeekDone:
     repo: str
     pr_number: int

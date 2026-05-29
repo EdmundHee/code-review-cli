@@ -14,7 +14,7 @@ import threading
 import yaml
 
 from .config import Config, ConfigError, load_config, merge_reloadable
-from .events import ConfigReloaded, CycleStarted, PrOutcome, RepoListed
+from .events import ConfigReloaded, CycleStarted, PrOutcome, RepoDone, RepoListed
 from .github import GhError
 from .models import ACTION_ERROR
 
@@ -135,6 +135,8 @@ class PollLoop:
                 prs = self.gh.list_open_prs(repo)
             except GhError as e:
                 log.error("list failed repo=%s: %s", repo, e)
+                if self.bus:  # still mark the repo polled so its freshness updates
+                    self.bus.publish(RepoDone(repo=repo))
                 continue
             if self.bus:
                 self.bus.publish(RepoListed(repo=repo, open_prs=len(prs)))
@@ -161,6 +163,8 @@ class PollLoop:
                         )
                     except Exception:
                         pass
+            if self.bus:  # end of this repo's poll (incl. skip_seen PRs)
+                self.bus.publish(RepoDone(repo=repo))
 
     def run_forever(self, install_signals: bool = True) -> None:
         if install_signals:

@@ -1,6 +1,10 @@
+import dataclasses
+
 import threading
 
-from ghcr.events import EventBus, PrOutcome
+import pytest
+
+from ghcr.events import EventBus, PrOutcome, RepoDone
 
 
 def test_publish_with_no_subscribers_is_noop():
@@ -35,3 +39,10 @@ def test_publish_is_thread_safe():
         t.join()
 
     assert len(received) == 8 * 50
+
+
+def test_repo_done_is_frozen():
+    evt = RepoDone(repo="o/r")
+    assert evt.repo == "o/r"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        evt.repo = "x"  # type: ignore[misc]

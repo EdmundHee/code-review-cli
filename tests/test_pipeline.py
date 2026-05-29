@@ -110,3 +110,25 @@ def test_synthesize_clean_when_no_findings_and_tests_present():
 def test_synthesize_notes_lens_errors():
     md = synthesize_markdown([], None, lens_errors=["security"])
     assert "## Notes" in md and "security" in md
+
+
+def test_synthesize_surfaces_dropped_when_all_below_bar():
+    # 7 findings scored, none kept (all below the threshold) — must not read as
+    # "nothing found"; surface the dropped count and the bar that filtered them.
+    md = synthesize_markdown([], None, scored_total=7, threshold=80)
+    assert "No high-confidence issues" not in md
+    assert "7" in md and "≥80" in md and "dropped" in md
+    assert "## Findings" not in md
+
+
+def test_synthesize_surfaces_dropped_alongside_survivors():
+    findings = [Finding(severity="BLOCKER", file="a.py", issue="npe", confidence=90)]
+    md = synthesize_markdown(findings, None, scored_total=4, threshold=80)
+    assert "1 high-confidence finding" in md
+    assert "3 more below the bar" in md and "≥80" in md
+
+
+def test_synthesize_no_dropped_keeps_plain_clean_message():
+    # No scored_total passed (e.g. zero findings ever) → original wording.
+    md = synthesize_markdown([], None)
+    assert "No high-confidence issues found" in md
