@@ -174,13 +174,28 @@ def classify_test_signal(fd, test_globs) -> tuple[bool, bool]:
 
 
 # -- synthesis --------------------------------------------------------------
-def synthesize_markdown(findings, coverage, *, lens_errors=()) -> str:
+def synthesize_markdown(findings, coverage, *, lens_errors=(), scored_total=0, threshold=None) -> str:
     """Render surviving findings + the coverage verdict into the comment body
-    (same shape the old single-pass SYSTEM_PROMPT produced)."""
+    (same shape the old single-pass SYSTEM_PROMPT produced).
+
+    ``scored_total`` is how many findings were scored before the confidence
+    filter; ``threshold`` is the bar they had to clear. When some scored findings
+    were dropped, the summary says so — otherwise an all-dropped review reads as
+    "nothing found" when the lenses did surface issues, just below the bar.
+    """
     n = len(findings)
+    dropped = max(0, scored_total - n)
+    bar = f" (confidence ≥{threshold})" if threshold is not None else ""
     lines: list[str] = ["## Summary"]
-    if n == 0:
+    if n == 0 and dropped:
+        lines.append(f"No findings cleared the confidence bar{bar}: {dropped} scored lower and were dropped.")
+    elif n == 0:
         lines.append("No high-confidence issues found in this diff.")
+    elif dropped:
+        lines.append(
+            f"{n} high-confidence finding{'s' if n != 1 else ''} after scoring "
+            f"({dropped} more below the bar{bar})."
+        )
     else:
         lines.append(f"{n} high-confidence finding{'s' if n != 1 else ''} after scoring.")
 

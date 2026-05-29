@@ -226,18 +226,25 @@ class ReviewOrchestrator:
 
         # Score each finding (parallel); keep only high-confidence survivors.
         survivors: list = []
+        scored_total = 0
         if findings:
             scored = self._map_parallel(findings, lambda f: self._score_finding(f, pr, fd, rc.scoring_votes))
             for f, conf, reason, score_usages in scored:
                 usages.extend(score_usages)
-                if conf is not None and conf >= rc.confidence_threshold:
+                if conf is None:
+                    continue
+                scored_total += 1  # got a score → counts toward the dropped tally
+                if conf >= rc.confidence_threshold:
                     survivors.append(replace(f, confidence=conf, reason=reason))
             survivors.sort(key=lambda f: (_SEV_RANK.get(f.severity, 9), f.id))
 
         latency_s = time.monotonic() - t0
         usage = merge_usages(usages)
         cost = estimate_cost_usd(usage, self.cfg.deepseek.prices)
-        content = synthesize_markdown(survivors, coverage, lens_errors=lens_errors)
+        content = synthesize_markdown(
+            survivors, coverage, lens_errors=lens_errors,
+            scored_total=scored_total, threshold=rc.confidence_threshold,
+        )
 
         if self.bus:
             self.bus.publish(DeepSeekDone(

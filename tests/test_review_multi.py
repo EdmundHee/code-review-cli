@@ -66,7 +66,10 @@ def test_below_threshold_findings_filtered_but_still_posts(tmp_path):
     out = orch.review_pr(make_pr())
     assert out.action == "review"
     body = gh.posted[0][2]
-    assert "No high-confidence issues" in body
+    # The lone finding scored 50 (< threshold 80) → dropped, but the comment now
+    # surfaces that instead of reading as a bare "nothing found".
+    assert "No high-confidence issues" not in body
+    assert "1 scored lower" in body and "≥80" in body
     assert "[BLOCKER]" not in body
     assert store.already_reviewed("owner/repo", 1, "a" * 40)
 

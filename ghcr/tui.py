@@ -25,13 +25,29 @@ from rich.table import Table
 from rich.text import Text
 
 from .config import Config
-from .events import AgentEvent, ConfigReloaded, CycleStarted, DeepSeekDone, EventBus, LogLine, PrOutcome, RepoListed
+from .events import (
+    AgentEvent,
+    ConfigReloaded,
+    CycleStarted,
+    DeepSeekDone,
+    EventBus,
+    LogLine,
+    PrOutcome,
+    RepoDone,
+    RepoListed,
+)
 from .github import GhClient
 from .models import ACTION_SKIP_SEEN
 from .poller import baseline_if_first_run, preflight
 from .state import StateStore
 
 _REVIEW_OUTCOMES = ("review", "reviewed")
+
+
+def _blank_repo() -> dict:
+    """Default per-repo render slot. ``polled_at`` is the UTC time the repo last
+    finished a poll (drives the "time since last poll" freshness column)."""
+    return {"open_prs": None, "last": "—", "polled_at": None}
 
 
 def _utcnow() -> datetime:
@@ -79,7 +95,10 @@ class DashboardState:
         self.model = cfg.deepseek.model
         self.budget = cfg.budgets.daily_usd_budget
         self.interval_s = cfg.poll_interval_seconds
-        self.repos: dict[str, dict] = {r: {"open_prs": None, "last": "—"} for r in cfg.repos}
+        self.repos: dict[str, dict] = {r: _blank_repo() for r in cfg.repos}
+        # The repo currently being polled (set on RepoListed, cleared on RepoDone)
+        # so the dashboard can highlight exactly one active row, none while idle.
+        self.active_repo: str | None = None
         self.latest: DeepSeekDone | None = None
         self.cost_rows: deque = deque(maxlen=50)
         self.events: deque = deque(maxlen=200)
@@ -117,14 +136,21 @@ def reduce(state: DashboardState, evt: object) -> None:
         state.interval_s = evt.interval_s
         state.budget = evt.budget
         for repo in evt.repos:  # add newly-configured repos
-            state.repos.setdefault(repo, {"open_prs": None, "last": "—"})
+            state.repos.setdefault(repo, _blank_repo())
         for repo in [r for r in state.repos if r not in evt.repos]:  # drop removed ones
             del state.repos[repo]
         state.events.append(f"{_hhmmss(_utcnow())} config reloaded: {len(evt.repos)} repo(s)")
     elif isinstance(evt, RepoListed):
         if evt.repo not in state.repos:
-            state.repos[evt.repo] = {"open_prs": None, "last": "—"}
+            state.repos[evt.repo] = _blank_repo()
         state.repos[evt.repo]["open_prs"] = evt.open_prs
+        state.active_repo = evt.repo  # start of this repo's poll → highlight it
+    elif isinstance(evt, RepoDone):
+        if evt.repo not in state.repos:
+            state.repos[evt.repo] = _blank_repo()
+        state.repos[evt.repo]["polled_at"] = _utcnow()  # reset freshness clock
+        if state.active_repo == evt.repo:
+            state.active_repo = None  # done → drop the highlight (idle until next)
     elif isinstance(evt, AgentEvent):
         key = (evt.repo, evt.pr_number)
         if key != state.agents_pr:  # a new PR started → reset the agent board
@@ -141,7 +167,7 @@ def reduce(state: DashboardState, evt: object) -> None:
         )
     elif isinstance(evt, PrOutcome):
         if evt.repo not in state.repos:
-            state.repos[evt.repo] = {"open_prs": None, "last": "—"}
+            state.repos[evt.repo] = _blank_repo()
         # skip_seen fires every poll cycle for any already-reviewed PR and writes
         # no DB row — it carries no new info. Letting it through would clobber the
         # recorded review line ("#2 review $0.018") with "#2 skip_seen $0.0000" and
@@ -179,12 +205,22 @@ def _header(state: DashboardState) -> Panel:
 
 def _monitoring(state: DashboardState) -> Panel:
     t = Table.grid(padding=(0, 1), expand=True)
-    t.add_column(style="bold", no_wrap=True)
-    t.add_column(justify="right", no_wrap=True)
-    t.add_column(ratio=1, overflow="ellipsis")
+    t.add_column(style="bold", no_wrap=True)       # repo
+    t.add_column(justify="right", no_wrap=True)     # open PR count
+    t.add_column(justify="right", no_wrap=True)     # poll freshness
+    t.add_column(ratio=1, overflow="ellipsis")      # last outcome
     for repo, st in state.repos.items():
         prs = "?" if st["open_prs"] is None else str(st["open_prs"])
-        t.add_row(repo, f"{prs} open", st["last"])
+        if repo == state.active_repo:
+            age = "polling…"
+        elif st["polled_at"] is not None:
+            age = f"{_fmt_uptime((_utcnow() - st['polled_at']).total_seconds())} ago"
+        else:
+            age = "—"
+        # Full-row reverse highlight marks the repo under active poll; cleared on
+        # RepoDone so nothing is highlighted during the inter-cycle sleep.
+        row_style = "reverse" if repo == state.active_repo else ""
+        t.add_row(repo, f"{prs} open", age, st["last"], style=row_style)
     return Panel(t, title="MONITORING", border_style="blue", title_align="left")
 
 

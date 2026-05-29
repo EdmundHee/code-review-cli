@@ -1,4 +1,13 @@
-from ghcr.events import AgentEvent, ConfigReloaded, CycleStarted, DeepSeekDone, LogLine, PrOutcome, RepoListed
+from ghcr.events import (
+    AgentEvent,
+    ConfigReloaded,
+    CycleStarted,
+    DeepSeekDone,
+    LogLine,
+    PrOutcome,
+    RepoDone,
+    RepoListed,
+)
 from ghcr.tui import DashboardState, build_layout
 from tests.fakes import make_config
 
@@ -12,6 +21,28 @@ def test_repo_listed_updates_open_pr_count(tmp_path):
     state, _ = _state(tmp_path)
     state.apply(RepoListed(repo="owner/repo", open_prs=3))
     assert state.repos["owner/repo"]["open_prs"] == 3
+
+
+def test_repo_listed_marks_repo_active(tmp_path):
+    state, _ = _state(tmp_path)
+    state.apply(RepoListed(repo="owner/repo", open_prs=3))
+    assert state.active_repo == "owner/repo"
+
+
+def test_repo_done_clears_active_and_stamps_polled_at(tmp_path):
+    state, _ = _state(tmp_path)
+    state.apply(RepoListed(repo="owner/repo", open_prs=3))
+    state.apply(RepoDone(repo="owner/repo"))
+    assert state.active_repo is None
+    assert state.repos["owner/repo"]["polled_at"] is not None
+
+
+def test_repo_done_for_other_repo_keeps_current_active(tmp_path):
+    state, _ = _state(tmp_path)
+    state.apply(RepoListed(repo="owner/repo", open_prs=1))
+    state.apply(RepoDone(repo="owner/other"))  # a different repo finishing
+    assert state.active_repo == "owner/repo"  # ours is still active
+    assert state.repos["owner/other"]["polled_at"] is not None
 
 
 def test_cycle_started_sets_interval_and_logs(tmp_path):
@@ -127,3 +158,13 @@ def test_build_layout_renders_without_error(tmp_path):
     # Render to a string region to ensure no exceptions in the Rich tree.
     from rich.console import Console
     Console(width=120, height=40, file=open("/dev/null", "w")).print(layout)
+
+
+def test_build_layout_renders_active_repo_row(tmp_path):
+    # RepoListed with no following RepoDone leaves the repo active → the
+    # highlighted "polling…" row path must render cleanly.
+    state, _ = _state(tmp_path)
+    state.apply(RepoListed(repo="owner/repo", open_prs=2))
+    assert state.active_repo == "owner/repo"
+    from rich.console import Console
+    Console(width=120, height=40, file=open("/dev/null", "w")).print(build_layout(state))
