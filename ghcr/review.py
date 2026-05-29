@@ -8,6 +8,7 @@ posted BEFORE the DB row is written (a failed post must not be recorded as done)
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -15,6 +16,7 @@ from . import comment as comment_mod
 from .config import Config
 from .cost import estimate_cost_usd, estimate_input_tokens
 from .deepseek import DeepSeekError
+from .events import DeepSeekDone
 from .diff_filter import filter_diff
 from .github import GhError
 from .models import (
@@ -42,11 +44,12 @@ class ReviewOutcome:
 
 
 class ReviewOrchestrator:
-    def __init__(self, gh, deepseek, store, config: Config, now=None):
+    def __init__(self, gh, deepseek, store, config: Config, now=None, bus=None):
         self.gh = gh
         self.deepseek = deepseek
         self.store = store
         self.cfg = config
+        self.bus = bus
         self._now = now or (lambda: datetime.now(timezone.utc))
 
     # -- decision (no spend, no DB write) --------------------------------
@@ -95,12 +98,22 @@ class ReviewOrchestrator:
             return self._handle_budget(pr, ts)
 
         # Spend money.
+        t0 = time.monotonic()
         try:
             result = self.deepseek.review(SYSTEM_PROMPT, user_prompt)
         except DeepSeekError as e:
             self.store.record(pr.repo, pr.number, pr.head_sha, ACTION_ERROR, model=model, error=str(e))
             log.error("deepseek failed repo=%s pr=%s: %s", pr.repo, pr.number, e)
             return ReviewOutcome(ACTION_ERROR)
+        latency_s = time.monotonic() - t0
+
+        if self.bus:
+            self.bus.publish(DeepSeekDone(
+                repo=pr.repo, pr_number=pr.number,
+                prompt_tokens=result.usage.prompt_tokens,
+                completion_tokens=result.usage.completion_tokens,
+                latency_s=latency_s, snippet=result.content[:280], title=pr.title,
+            ))
 
         cost = estimate_cost_usd(result.usage, self.cfg.deepseek.prices)
         body = comment_mod.build_comment(

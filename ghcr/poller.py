@@ -12,6 +12,7 @@ import signal
 import threading
 
 from .config import Config
+from .events import CycleStarted, PrOutcome, RepoListed
 from .github import GhError
 from .models import ACTION_ERROR
 
@@ -54,10 +55,11 @@ def baseline_if_first_run(gh, store, cfg: Config) -> int:
 
 
 class PollLoop:
-    def __init__(self, orchestrator, gh, config: Config):
+    def __init__(self, orchestrator, gh, config: Config, bus=None):
         self.orch = orchestrator
         self.gh = gh
         self.cfg = config
+        self.bus = bus
         self._stop = threading.Event()
 
     def install_signals(self) -> None:
@@ -66,6 +68,14 @@ class PollLoop:
 
     def _on_signal(self, *_args) -> None:
         log.info("shutdown signal received; finishing current item then exiting")
+        self._stop.set()
+
+    def request_stop(self) -> None:
+        """Ask the loop to finish the current item and exit. Thread-safe.
+
+        Used by the TUI (running in the main thread) to stop the loop thread,
+        where ``signal.signal`` cannot be installed.
+        """
         self._stop.set()
 
     def run_once(self) -> None:
@@ -77,6 +87,8 @@ class PollLoop:
             except GhError as e:
                 log.error("list failed repo=%s: %s", repo, e)
                 continue
+            if self.bus:
+                self.bus.publish(RepoListed(repo=repo, open_prs=len(prs)))
             for pr in prs:
                 if self._stop.is_set():
                     return
@@ -86,6 +98,12 @@ class PollLoop:
                         "repo=%s pr=%d action=%s cost=$%.4f",
                         repo, pr.number, outcome.action, outcome.cost_usd,
                     )
+                    if self.bus:
+                        self.bus.publish(PrOutcome(
+                            repo=repo, pr_number=pr.number, action=outcome.action,
+                            cost_usd=outcome.cost_usd, comment_url=outcome.comment_url,
+                            title=pr.title,
+                        ))
                 except Exception as e:  # isolate: one PR must not kill the loop
                     log.exception("review crashed repo=%s pr=%d", repo, pr.number)
                     try:
@@ -95,9 +113,14 @@ class PollLoop:
                     except Exception:
                         pass
 
-    def run_forever(self) -> None:
-        self.install_signals()
+    def run_forever(self, install_signals: bool = True) -> None:
+        if install_signals:
+            self.install_signals()
         log.info("polling %d repo(s) every %ds", len(self.cfg.repos), self.cfg.poll_interval_seconds)
+        if self.bus:
+            self.bus.publish(CycleStarted(
+                repo_count=len(self.cfg.repos), interval_s=self.cfg.poll_interval_seconds,
+            ))
         while not self._stop.is_set():
             self.run_once()
             if self._stop.is_set():

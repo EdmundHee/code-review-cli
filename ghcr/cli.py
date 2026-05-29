@@ -25,7 +25,7 @@ def _setup_logging(level: str) -> None:
     )
 
 
-def _build(cfg: Config):
+def _build(cfg: Config, bus=None):
     gh = GhClient(cfg.github.gh_path, cfg.github.token, cfg.github.request_timeout_seconds)
     ds = DeepSeekClient(
         api_key=cfg.deepseek.api_key,
@@ -36,7 +36,7 @@ def _build(cfg: Config):
         timeout=cfg.deepseek.request_timeout_seconds,
     )
     store = StateStore(cfg.db_path)
-    orch = ReviewOrchestrator(gh, ds, store, cfg)
+    orch = ReviewOrchestrator(gh, ds, store, cfg, bus=bus)
     return gh, ds, store, orch
 
 
@@ -80,6 +80,20 @@ def cmd_check_config(cfg: Config) -> int:
     return 0
 
 
+def cmd_tui(cfg: Config) -> int:
+    lock = _acquire_lock(cfg.db_path)  # noqa: F841 — held until exit
+    try:
+        from .tui import run_tui
+    except ImportError as e:
+        print(
+            f"TUI needs the 'rich' package ({e}). Install it: "
+            f"source .venv/bin/activate && pip install -e .",
+            file=sys.stderr,
+        )
+        return 1
+    return run_tui(cfg)
+
+
 def cmd_status(cfg: Config) -> int:
     store = StateStore(cfg.db_path)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
@@ -106,6 +120,7 @@ def main(argv=None) -> int:
     s_once.add_argument("--pr", required=True, type=int)
     sub.add_parser("check-config", help="validate config + bot identity")
     sub.add_parser("status", help="show recent reviews and 24h spend")
+    sub.add_parser("tui", help="run the polling daemon with a live dashboard")
     args = p.parse_args(argv)
 
     try:
@@ -125,6 +140,8 @@ def main(argv=None) -> int:
             return cmd_check_config(cfg)
         if args.cmd == "status":
             return cmd_status(cfg)
+        if args.cmd == "tui":
+            return cmd_tui(cfg)
     except (GhError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
