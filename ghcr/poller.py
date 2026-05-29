@@ -151,7 +151,7 @@ class PollLoop:
                         self.bus.publish(PrOutcome(
                             repo=repo, pr_number=pr.number, action=outcome.action,
                             cost_usd=outcome.cost_usd, comment_url=outcome.comment_url,
-                            title=pr.title,
+                            title=pr.title, head_sha=pr.head_sha,
                         ))
                 except Exception as e:  # isolate: one PR must not kill the loop
                     log.exception("review crashed repo=%s pr=%d", repo, pr.number)

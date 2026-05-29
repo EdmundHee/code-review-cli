@@ -32,10 +32,12 @@ def test_deepseek_done_becomes_latest(tmp_path):
 
 def test_pr_outcome_review_adds_cost_row_and_spend(tmp_path):
     state, _ = _state(tmp_path)
-    state.apply(PrOutcome(repo="owner/repo", pr_number=42, action="review", cost_usd=0.018))
+    state.apply(PrOutcome(repo="owner/repo", pr_number=42, action="review",
+                          cost_usd=0.018, head_sha="a1b2c3d4e5f6"))
     assert state.spent_24h == 0.018
     assert state.cost_rows[-1]["pr"] == 42
-    assert state.repos["owner/repo"]["last"].startswith("#42 review")
+    # last column shows the action AND the short commit SHA that was reviewed.
+    assert state.repos["owner/repo"]["last"] == "#42 review a1b2c3d $0.0180"
 
 
 def test_pr_outcome_transient_skip_no_cost_row(tmp_path):
@@ -84,13 +86,13 @@ def test_log_line_appended_to_history(tmp_path):
 def test_seed_populates_from_db_rows(tmp_path):
     state, _ = _state(tmp_path)
     rows = [
-        {"repo": "owner/repo", "pr_number": 41, "outcome": "reviewed",
+        {"repo": "owner/repo", "pr_number": 41, "outcome": "reviewed", "head_sha": "deadbeef1234",
          "cost_usd": 0.012, "created_at": "2026-05-29T11:00:00+00:00"},
     ]
     state.seed(rows, spent_24h=0.012)
     assert state.spent_24h == 0.012
     assert state.cost_rows[-1]["pr"] == 41
-    assert state.repos["owner/repo"]["last"].startswith("#41 reviewed")
+    assert state.repos["owner/repo"]["last"] == "#41 reviewed deadbee $0.0120"
 
 
 def test_build_layout_renders_without_error(tmp_path):

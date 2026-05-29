@@ -58,6 +58,17 @@ def _fmt_uptime(seconds: float) -> str:
     return f"{sec}s"
 
 
+def _outcome_detail(pr_number: int, action: str, head_sha: str, cost_usd: float) -> str:
+    """One-line per-PR outcome, e.g. '#2 review a1b2c3d $0.0180'.
+
+    Includes the short head SHA so the dashboard shows *which* commit was acted
+    on; the SHA is omitted when unknown (older rows / events without it).
+    """
+    sha = (head_sha or "")[:7]
+    sha_part = f" {sha}" if sha else ""
+    return f"#{pr_number} {action}{sha_part} ${cost_usd:.4f}"
+
+
 class DashboardState:
     """Render state, mutated only via ``apply`` under a lock."""
 
@@ -80,11 +91,13 @@ class DashboardState:
         for row in reversed(list(rows)):  # oldest first so newest ends up last
             repo, num = row["repo"], row["pr_number"]
             outcome, cost = row["outcome"], float(row["cost_usd"] or 0.0)
+            sha = row["head_sha"] if "head_sha" in row.keys() else ""
+            detail = _outcome_detail(num, outcome, sha, cost)
             if repo in self.repos:
-                self.repos[repo]["last"] = f"#{num} {outcome} ${cost:.4f}"
+                self.repos[repo]["last"] = detail
             if outcome in _REVIEW_OUTCOMES or cost > 0:
                 self.cost_rows.append({"pr": num, "repo": repo, "cost": cost, "outcome": outcome})
-            self.events.append(f"{_hhmmss(row['created_at'])} {repo}#{num} {outcome} ${cost:.4f}")
+            self.events.append(f"{_hhmmss(row['created_at'])} {repo} {detail}")
 
     # -- live events (worker thread) -------------------------------------
     def apply(self, evt: object) -> None:
@@ -125,15 +138,14 @@ def reduce(state: DashboardState, evt: object) -> None:
         if evt.action == ACTION_SKIP_SEEN:
             return
         mark = "✓" if evt.action in _REVIEW_OUTCOMES else evt.action
-        state.repos[evt.repo]["last"] = f"#{evt.pr_number} {evt.action} ${evt.cost_usd:.4f}"
+        detail = _outcome_detail(evt.pr_number, evt.action, evt.head_sha, evt.cost_usd)
+        state.repos[evt.repo]["last"] = detail
         if evt.action in _REVIEW_OUTCOMES or evt.cost_usd > 0:
             state.cost_rows.append(
                 {"pr": evt.pr_number, "repo": evt.repo, "cost": evt.cost_usd, "outcome": evt.action}
             )
             state.spent_24h += evt.cost_usd
-        state.events.append(
-            f"{_hhmmss(_utcnow())} {evt.repo}#{evt.pr_number} {evt.action} ${evt.cost_usd:.4f} {mark}"
-        )
+        state.events.append(f"{_hhmmss(_utcnow())} {evt.repo} {detail} {mark}")
     elif isinstance(evt, LogLine):
         state.events.append(f"{evt.ts} {evt.name}: {evt.message}")
 
