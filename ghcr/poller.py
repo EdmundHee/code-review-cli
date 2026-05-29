@@ -11,8 +11,10 @@ import logging
 import signal
 import threading
 
-from .config import Config
-from .events import CycleStarted, PrOutcome, RepoListed
+import yaml
+
+from .config import Config, ConfigError, load_config, merge_reloadable
+from .events import ConfigReloaded, CycleStarted, PrOutcome, RepoListed
 from .github import GhError
 from .models import ACTION_ERROR
 
@@ -55,12 +57,16 @@ def baseline_if_first_run(gh, store, cfg: Config) -> int:
 
 
 class PollLoop:
-    def __init__(self, orchestrator, gh, config: Config, bus=None):
+    def __init__(self, orchestrator, gh, config: Config, bus=None, config_path: str | None = None):
         self.orch = orchestrator
         self.gh = gh
         self.cfg = config
         self.bus = bus
+        self._config_path = config_path
         self._stop = threading.Event()
+        self._wake = threading.Event()  # breaks the inter-cycle sleep (stop or reload)
+        self._cfg_lock = threading.Lock()
+        self._pending: Config | None = None
 
     def install_signals(self) -> None:
         signal.signal(signal.SIGINT, self._on_signal)
@@ -68,7 +74,7 @@ class PollLoop:
 
     def _on_signal(self, *_args) -> None:
         log.info("shutdown signal received; finishing current item then exiting")
-        self._stop.set()
+        self.request_stop()
 
     def request_stop(self) -> None:
         """Ask the loop to finish the current item and exit. Thread-safe.
@@ -77,8 +83,51 @@ class PollLoop:
         where ``signal.signal`` cannot be installed.
         """
         self._stop.set()
+        self._wake.set()
+
+    # -- live config reload ----------------------------------------------
+    def set_pending_config(self, cfg: Config) -> None:
+        """Stage a new config to swap in at the next cycle boundary. Thread-safe."""
+        with self._cfg_lock:
+            self._pending = cfg
+        self._wake.set()  # cut the sleep short so the new repos are picked up now
+
+    def _apply_pending_config(self) -> None:
+        """Swap a staged config into the loop + orchestrator. Called between cycles."""
+        with self._cfg_lock:
+            pending, self._pending = self._pending, None
+        if pending is None:
+            return
+        self.cfg = pending
+        self.orch.cfg = pending
+        log.info("config reloaded: %d repo(s), interval %ds", len(pending.repos), pending.poll_interval_seconds)
+        if self.bus:
+            self.bus.publish(ConfigReloaded(
+                repos=tuple(pending.repos),
+                interval_s=pending.poll_interval_seconds,
+                budget=pending.budgets.daily_usd_budget,
+            ))
+
+    def _on_config_file_changed(self) -> None:
+        """Watcher callback: reload from disk, merge safe fields, stage it.
+
+        Never crashes the loop — a bad edit is logged and the running config is
+        kept until the next valid save.
+        """
+        if not self._config_path:
+            return
+        try:
+            new = load_config(self._config_path, resolve_secrets=False)
+        except (ConfigError, yaml.YAMLError, OSError) as e:
+            log.warning("config reload skipped (invalid): %s", e)
+            return
+        merged, restart_only = merge_reloadable(self.cfg, new)
+        if restart_only:
+            log.warning("config changed in %s — restart required to apply those", ", ".join(restart_only))
+        self.set_pending_config(merged)
 
     def run_once(self) -> None:
+        self._apply_pending_config()
         for repo in self.cfg.repos:
             if self._stop.is_set():
                 return
@@ -102,7 +151,7 @@ class PollLoop:
                         self.bus.publish(PrOutcome(
                             repo=repo, pr_number=pr.number, action=outcome.action,
                             cost_usd=outcome.cost_usd, comment_url=outcome.comment_url,
-                            title=pr.title,
+                            title=pr.title, head_sha=pr.head_sha,
                         ))
                 except Exception as e:  # isolate: one PR must not kill the loop
                     log.exception("review crashed repo=%s pr=%d", repo, pr.number)
@@ -121,9 +170,25 @@ class PollLoop:
             self.bus.publish(CycleStarted(
                 repo_count=len(self.cfg.repos), interval_s=self.cfg.poll_interval_seconds,
             ))
-        while not self._stop.is_set():
-            self.run_once()
-            if self._stop.is_set():
-                break
-            self._stop.wait(self.cfg.poll_interval_seconds)
+        watcher = self._start_watcher()
+        try:
+            while not self._stop.is_set():
+                self._wake.clear()  # cleared before the cycle so a reload during it survives
+                self.run_once()
+                if self._stop.is_set():
+                    break
+                self._wake.wait(self.cfg.poll_interval_seconds)
+        finally:
+            if watcher is not None:
+                watcher.stop()
         log.info("stopped")
+
+    def _start_watcher(self):
+        """Start watching the config file for live reload. No-op without a path."""
+        if not self._config_path:
+            return None
+        from .watcher import ConfigWatcher
+
+        watcher = ConfigWatcher(self._config_path, self._on_config_file_changed)
+        watcher.start()
+        return watcher

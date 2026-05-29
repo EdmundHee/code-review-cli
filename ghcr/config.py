@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import yaml
 
@@ -92,6 +92,26 @@ class Config:
     budgets: BudgetConfig
     db_path: str
     log_level: str
+
+
+# Fields safe to swap into a running loop (read fresh every cycle/PR). The rest
+# bind something at startup that a live swap won't touch: github/deepseek/db_path
+# construct a client or store, and log_level is applied once via logging.basicConfig
+# (nothing re-runs setLevel on reload), so all of them need a restart to take effect.
+_RELOADABLE = ("repos", "poll_interval_seconds", "review_policy", "diff", "budgets")
+_RESTART_ONLY = ("github", "deepseek", "db_path", "log_level")
+
+
+def merge_reloadable(old: Config, new: Config) -> tuple[Config, list[str]]:
+    """Return ``old`` with hot-reloadable fields taken from ``new``.
+
+    Restart-only fields (github/deepseek/db_path) are kept from ``old``; any that
+    differ in ``new`` are returned in the second element so the caller can warn a
+    restart is needed to apply them.
+    """
+    merged = replace(old, **{f: getattr(new, f) for f in _RELOADABLE})
+    changed = [f for f in _RESTART_ONLY if getattr(old, f) != getattr(new, f)]
+    return merged, changed
 
 
 def _require_env(env, name: str, what: str) -> str:

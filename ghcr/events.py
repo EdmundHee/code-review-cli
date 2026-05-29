@@ -44,6 +44,14 @@ class PrOutcome:
     cost_usd: float = 0.0
     comment_url: str | None = None
     title: str = ""
+    head_sha: str = ""
+
+
+@dataclass(frozen=True)
+class ConfigReloaded:
+    repos: tuple[str, ...]
+    interval_s: int
+    budget: float
 
 
 @dataclass(frozen=True)
