@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Copy to ~/Library/LaunchAgents/ and edit the paths, then:
+       launchctl load ~/Library/LaunchAgents/com.edmundhee.ghcr.plist
+     Unload with `launchctl unload <path>`. No secrets live here — run-ghcr.sh
+     sources them from a chmod-600 env file. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.edmundhee.ghcr</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/edmundhee/Work/GitHub/GithubCodeReview/run-ghcr.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>WorkingDirectory</key><string>/Users/edmundhee/Work/GitHub/GithubCodeReview</string>
+  <key>StandardOutPath</key><string>/Users/edmundhee/Library/Logs/ghcr.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/edmundhee/Library/Logs/ghcr.err.log</string>
+</dict>
+</plist>

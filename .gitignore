@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Secrets & local config (never commit)
+config.yaml
+*.env
+secrets.*
+
+# Local state
+*.db
+*.db-wal
+*.db-shm
+
+# Logs
+*.log

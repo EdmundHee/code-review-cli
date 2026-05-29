@@ -1,0 +1,68 @@
+# Copy to config.yaml and edit. config.yaml is gitignored.
+# Secrets are NOT stored here — only the names of the env vars that hold them.
+
+github:
+  gh_path: /opt/homebrew/bin/gh      # ABSOLUTE path — bypasses shell shims/aliases
+  token_env: GH_TOKEN                 # daemon reads the bot PAT from this env var
+  bot_login: edmundhee-reviewbot      # the bot's REAL username (no [bot] suffix)
+  request_timeout_seconds: 60
+
+deepseek:
+  api_key_env: DEEPSEEK_API_KEY
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-pro
+  thinking: enabled                   # enabled | disabled
+  reasoning_effort: high              # high | max  (only used when thinking=enabled)
+  request_timeout_seconds: 600
+  prices:                             # USD per 1M tokens — for cost logging only
+    input_per_1m: 0.28
+    output_per_1m: 3.48               # post-promo rate (promo ended 2026-05-31)
+
+repos:
+  - owner/repo-one
+  # - owner/repo-two
+
+poll:
+  interval_seconds: 120
+
+review_policy:
+  skip_drafts: true
+  review_backlog_on_start: false      # false = baseline existing open PRs as seen on first run
+  ignore_authors:
+    - dependabot[bot]
+    - renovate[bot]
+    - github-actions[bot]
+  # bot_login is always added to this set automatically.
+
+diff:
+  max_diff_bytes: 400000              # raw-read + post-filter cap
+  per_run_input_token_cap: 250000     # cost/context gate (chars/4 estimate)
+  oversized_behavior: notice          # notice | skip
+  skip_globs:
+    - "**/*.lock"
+    - "**/package-lock.json"
+    - "**/pnpm-lock.yaml"
+    - "**/yarn.lock"
+    - "**/*.min.js"
+    - "**/*.min.css"
+    - "**/dist/**"
+    - "**/build/**"
+    - "**/vendor/**"
+    - "**/node_modules/**"
+    - "**/__generated__/**"
+    - "**/*.pb.go"
+    - "**/*.snap"
+    - "**/*.svg"
+    - "**/*.png"
+    - "**/*.jpg"
+    - "**/*.pdf"
+
+budgets:
+  daily_usd_budget: 5.00              # rolling 24h ceiling across all reviews
+  budget_exceeded_behavior: notice    # notice | skip
+
+storage:
+  db_path: ~/.local/state/ghcr/ghcr.db
+
+logging:
+  level: INFO
