@@ -61,12 +61,16 @@ def cmd_run(cfg: Config, config_path: str | None = None) -> int:
     return 0
 
 
-def cmd_review_once(cfg: Config, repo: str, pr_number: int) -> int:
+def cmd_review_once(cfg: Config, repo: str, pr_number: int, dry_run: bool = False) -> int:
     gh, ds, store, orch = _build(cfg)
-    preflight(gh, cfg)
+    if not dry_run:
+        preflight(gh, cfg)  # dry-run never posts, so bot identity is irrelevant
     pr = gh.get_pr(repo, pr_number)
-    outcome = orch.review_pr(pr)
+    outcome = orch.review_pr(pr, dry_run=dry_run)
     print(f"{repo}#{pr_number} ({pr.head_sha[:7]}): {outcome.action} cost=${outcome.cost_usd:.4f}")
+    if dry_run and outcome.body:
+        print("\n--- review body (dry-run, NOT posted) ---\n")
+        print(outcome.body)
     if outcome.comment_url:
         print(outcome.comment_url)
     return 0
@@ -119,6 +123,7 @@ def main(argv=None) -> int:
     s_once = sub.add_parser("review-once", help="review a single PR and exit")
     s_once.add_argument("--repo", required=True)
     s_once.add_argument("--pr", required=True, type=int)
+    s_once.add_argument("--dry-run", action="store_true", help="build the review but print it instead of posting (no DB write)")
     sub.add_parser("check-config", help="validate config + bot identity")
     sub.add_parser("status", help="show recent reviews and 24h spend")
     sub.add_parser("tui", help="run the polling daemon with a live dashboard")
@@ -142,7 +147,7 @@ def main(argv=None) -> int:
         if args.cmd == "run":
             return cmd_run(cfg, config_path=args.config)
         if args.cmd == "review-once":
-            return cmd_review_once(cfg, args.repo, args.pr)
+            return cmd_review_once(cfg, args.repo, args.pr, dry_run=args.dry_run)
         if args.cmd == "check-config":
             return cmd_check_config(cfg)
         if args.cmd == "status":

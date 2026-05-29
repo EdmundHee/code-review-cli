@@ -37,6 +37,22 @@ class DeepSeekDone:
 
 
 @dataclass(frozen=True)
+class AgentEvent:
+    """One multi-pass sub-agent (a lens or a per-finding scorer) changing state.
+
+    Published from the review thread pool, so it must stay pure data — the bus is
+    thread-safe and the TUI only mutates in-memory state on receipt.
+    """
+
+    repo: str
+    pr_number: int
+    agent: str  # "lens:security" | "score:#3"
+    status: str  # "running" | "done" | "failed"
+    detail: str = ""
+    title: str = ""
+
+
+@dataclass(frozen=True)
 class PrOutcome:
     repo: str
     pr_number: int

@@ -14,7 +14,7 @@ import yaml
 from rich.console import Console
 from rich.prompt import Confirm, FloatPrompt, IntPrompt, Prompt
 
-from .config import _DEFAULT_SKIP_GLOBS, _REPO_RE, ConfigError, load_config
+from .config import _DEFAULT_SKIP_GLOBS, _DEFAULT_TEST_GLOBS, _REPO_RE, ConfigError, load_config
 
 _DEFAULT_IGNORE = ["dependabot[bot]", "renovate[bot]", "github-actions[bot]"]
 
@@ -140,7 +140,14 @@ def run_wizard(path: str, env=None, *, console: Console | None = None) -> int:
     db_path = ask.text("state db path", default=_g(cur, "storage", "db_path", default="~/.local/state/ghcr/ghcr.db"))
     log_level = ask.choice("log level", ["DEBUG", "INFO", "WARNING", "ERROR"], default=str(_g(cur, "logging", "level", default="INFO")).upper())
 
+    # -- review mode ------------------------------------------------------
+    out.print("\n[bold]Review mode[/bold] [dim](multi = lenses + per-finding scoring; more accurate, more calls)[/dim]")
+    review_mode = ask.choice("review mode", ["multi", "single"], default=_g(cur, "review", "mode", default="multi"))
+    confidence_threshold = ask.integer("confidence threshold (keep findings scored >= this)", default=int(_g(cur, "review", "confidence_threshold", default=80)))
+    scoring_votes = ask.integer("scoring votes per finding (odd = clean median)", default=int(_g(cur, "review", "scoring_votes", default=1)))
+
     skip_globs = list(_g(cur, "diff", "skip_globs", default=list(_DEFAULT_SKIP_GLOBS)))
+    test_globs = list(_g(cur, "diff", "test_globs", default=list(_DEFAULT_TEST_GLOBS)))
 
     data = {
         "github": {
@@ -170,8 +177,14 @@ def run_wizard(path: str, env=None, *, console: Console | None = None) -> int:
             "per_run_input_token_cap": token_cap,
             "oversized_behavior": oversized,
             "skip_globs": skip_globs,
+            "test_globs": test_globs,
         },
         "budgets": {"daily_usd_budget": budget, "budget_exceeded_behavior": budget_behavior},
+        "review": {
+            "mode": review_mode,
+            "confidence_threshold": confidence_threshold,
+            "scoring_votes": scoring_votes,
+        },
         "storage": {"db_path": db_path},
         "logging": {"level": log_level},
     }

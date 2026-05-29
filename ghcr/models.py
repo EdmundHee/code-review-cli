@@ -6,6 +6,7 @@ import cycles.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 
@@ -33,11 +34,70 @@ class Usage:
     total_tokens: int = 0
 
 
+def merge_usages(usages: Iterable[Usage]) -> Usage:
+    """Sum a sequence of per-call Usage objects into one aggregate.
+
+    Pure — the multi-pass pipeline calls the model many times (lenses + per-finding
+    scoring) and totals their token counts here before a single cost calculation.
+    """
+    p = c = t = 0
+    for u in usages:
+        p += u.prompt_tokens
+        c += u.completion_tokens
+        t += u.total_tokens
+    return Usage(prompt_tokens=p, completion_tokens=c, total_tokens=t)
+
+
 @dataclass(frozen=True)
 class ReviewResult:
     content: str
     usage: Usage
     model: str
+
+
+# -- multi-pass review pipeline types --------------------------------------
+# Severities a finding may carry, ordered most→least severe (drives grouping).
+SEVERITY_ORDER = ("BLOCKER", "WARNING", "MINOR")
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One issue raised by a review lens. ``confidence``/``reason`` are filled by
+    the scoring pass; ``id`` is assigned after merge/dedup to correlate scores."""
+
+    severity: str  # BLOCKER | WARNING | MINOR
+    file: str
+    area: str = ""
+    issue: str = ""
+    fix: str = ""
+    lens: str = ""
+    confidence: int | None = None
+    reason: str = ""
+    id: int = 0
+
+
+@dataclass(frozen=True)
+class CoverageVerdict:
+    """The test_coverage lens's structured read on whether the PR ships tests for
+    the behavior it changes. ``has_tests`` True also covers 'no tests needed'.
+
+    Named without a ``Test`` prefix so pytest does not try to collect it."""
+
+    has_tests: bool
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class LensResult:
+    """One lens's outcome. ``ok`` False means the call or its JSON parse failed —
+    findings are then empty but ``usage`` may still be non-zero (we paid for it)."""
+
+    lens: str
+    findings: tuple[Finding, ...]
+    usage: Usage
+    ok: bool
+    raw: str = ""
+    coverage: TestCoverageVerdict | None = None
 
 
 # Terminal action constants — recorded once per head SHA, block future re-review.

@@ -36,6 +36,9 @@ DEFAULT_ANSWERS = [
     "",           # 24 budget_exceeded_behavior
     "",           # 25 db_path
     "",           # 26 log level
+    "",           # 27 review mode
+    "",           # 28 confidence threshold
+    "",           # 29 scoring votes
 ]
 
 
@@ -54,6 +57,9 @@ def test_wizard_writes_loadable_config(tmp_path, monkeypatch):
     assert cfg.deepseek.model == "deepseek-v4-pro"
     assert cfg.budgets.daily_usd_budget == 5.0
     assert cfg.diff.skip_globs  # defaults written in
+    assert cfg.review.mode == "multi"  # accuracy-first default
+    assert cfg.review.confidence_threshold == 80
+    assert cfg.diff.test_globs  # test-coverage path heuristic defaults
 
 
 def test_wizard_rejects_then_accepts_repo(tmp_path, monkeypatch):
