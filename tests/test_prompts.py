@@ -5,6 +5,7 @@ from ghcr.prompts import (
     LENS_PROMPTS,
     SCORING_SYSTEM_PROMPT,
     build_scoring_user_prompt,
+    build_user_prompt,
     coverage_hint,
 )
 from tests.fakes import make_pr
@@ -45,3 +46,28 @@ def test_build_scoring_user_prompt_includes_finding_and_diff():
 def test_coverage_hint_reports_both_signals():
     h = coverage_hint(True, False)
     assert "True" in h and "False" in h
+
+
+# -- prior-comment context injection ----------------------------------------
+def _fd():
+    return FilteredDiff(text="THE DIFF", kept_paths=["a.py"], skipped_paths=[], changed_lines=1, kept_bytes=8)
+
+
+def test_build_user_prompt_omits_prior_block_by_default():
+    assert "PRIOR PR DISCUSSION" not in build_user_prompt(make_pr(), _fd())
+
+
+def test_build_user_prompt_includes_prior_block_when_given():
+    block = "## PRIOR PR DISCUSSION\n[bot 2026-06-01] earlier note\n"
+    out = build_user_prompt(make_pr(), _fd(), prior_context=block)
+    assert "PRIOR PR DISCUSSION" in out and "THE DIFF" in out
+
+
+def test_build_scoring_user_prompt_includes_prior_block_when_given():
+    f = Finding(severity="WARNING", file="a.py", area="g", issue="bug", fix="x", lens="correctness")
+    out = build_scoring_user_prompt(make_pr(), _fd(), f, prior_context="PRIOR-XYZ-MARK")
+    assert "PRIOR-XYZ-MARK" in out and "bug" in out
+
+
+def test_scoring_prompt_instructs_suppression_of_already_raised():
+    assert "already raised" in SCORING_SYSTEM_PROMPT.lower()

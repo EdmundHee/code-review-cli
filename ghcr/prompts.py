@@ -140,8 +140,10 @@ SCORING_SYSTEM_PROMPT = """\
 You are scoring ONE finding raised by a code reviewer against a GitHub pull request diff. \
 You see only the diff and the single finding. Rate your confidence that the finding is a \
 REAL, worth-reporting issue, on this 0-100 scale (use it verbatim):
-- 0: Not confident at all. A false positive that does not survive light scrutiny, or a \
-pre-existing issue on unchanged lines.
+- 0: Not confident at all. A false positive that does not survive light scrutiny, a \
+pre-existing issue on unchanged lines, or an issue ALREADY RAISED in the PRIOR PR \
+DISCUSSION (by this bot on an earlier commit or by a human) that this diff does not \
+reintroduce or worsen.
 - 25: Somewhat confident. Might be real, might be a false positive; you could not verify it. \
 A stylistic point not explicitly required.
 - 50: Moderately confident. Verified real, but possibly a nitpick or rare in practice; \
@@ -158,8 +160,16 @@ Return ONLY a JSON object — no prose, no markdown fences:
 """
 
 
-def build_scoring_user_prompt(pr: PullRequest, fd: FilteredDiff, finding) -> str:
-    """User payload for one scoring call: the finding under review + the diff."""
+def _prior_block(prior_context: str) -> str:
+    """A blank-line-padded prior-discussion block, or '' when none was supplied."""
+    return f"\n{prior_context.strip()}\n" if prior_context.strip() else ""
+
+
+def build_scoring_user_prompt(pr: PullRequest, fd: FilteredDiff, finding, prior_context: str = "") -> str:
+    """User payload for one scoring call: the finding under review + the diff.
+
+    When ``prior_context`` is supplied it is included so the scorer can return 0 for
+    a finding already raised in the PR's existing discussion (see SCORING_SYSTEM_PROMPT)."""
     head = (
         f"Repository: {pr.repo}  PR #{pr.number}: {pr.title}\n\n"
         f"Finding to score (raised by the '{finding.lens}' lens):\n"
@@ -169,10 +179,10 @@ def build_scoring_user_prompt(pr: PullRequest, fd: FilteredDiff, finding) -> str
         f"- issue: {finding.issue}\n"
         f"- suggested fix: {finding.fix}\n"
     )
-    return f"{head}\nUnified diff:\n```diff\n{fd.text}\n```\n"
+    return f"{head}{_prior_block(prior_context)}\nUnified diff:\n```diff\n{fd.text}\n```\n"
 
 
-def build_user_prompt(pr: PullRequest, fd: FilteredDiff, truncated: bool = False) -> str:
+def build_user_prompt(pr: PullRequest, fd: FilteredDiff, truncated: bool = False, prior_context: str = "") -> str:
     skipped = ", ".join(fd.skipped_paths) if fd.skipped_paths else "none"
     header = (
         f"Repository: {pr.repo}\n"
@@ -185,4 +195,4 @@ def build_user_prompt(pr: PullRequest, fd: FilteredDiff, truncated: bool = False
     )
     if truncated:
         header += "NOTE: the diff was truncated due to size; review only what is shown.\n"
-    return f"{header}\nUnified diff:\n```diff\n{fd.text}\n```\n"
+    return f"{header}{_prior_block(prior_context)}\nUnified diff:\n```diff\n{fd.text}\n```\n"

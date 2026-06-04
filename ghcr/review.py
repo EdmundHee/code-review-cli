@@ -44,6 +44,7 @@ from .pipeline import (
     parse_score,
     synthesize_markdown,
 )
+from .prior_context import build_prior_context
 from .prompts import (
     LENS_PROMPTS,
     SCORING_SYSTEM_PROMPT,
@@ -111,10 +112,16 @@ class ReviewOrchestrator:
                 self.store.record(pr.repo, pr.number, pr.head_sha, ACTION_SKIP_EMPTY, model=model)
             return ReviewOutcome(ACTION_SKIP_EMPTY)
 
-        user_prompt = build_user_prompt(pr, fd)
+        # Existing PR conversation as context (best-effort; failure → empty block).
+        prior_ctx = build_prior_context(
+            self._fetch_prior_comments(pr),
+            bot_login=self.cfg.github.bot_login,
+            max_chars=self.cfg.review.prior_comment_max_chars,
+        )
+        user_prompt = build_user_prompt(pr, fd, prior_context=prior_ctx)
 
         if self.cfg.review.mode == "multi":
-            return self._review_multi(pr, fd, user_prompt, ts, model, dry_run=dry_run)
+            return self._review_multi(pr, fd, user_prompt, ts, model, dry_run=dry_run, prior_ctx=prior_ctx)
 
         est_tokens = estimate_input_tokens(SYSTEM_PROMPT + user_prompt)
         if est_tokens > self.cfg.diff.per_run_input_token_cap:
@@ -175,8 +182,23 @@ class ReviewOrchestrator:
         )
         return ReviewOutcome(ACTION_REVIEW, cost_usd=cost, comment_url=url)
 
+    def _fetch_prior_comments(self, pr: PullRequest):
+        """Existing PR comments (issue timeline + inline review) as review context.
+
+        Best-effort: disabled by config, or any ``gh`` failure, yields ``[]`` — a
+        comment-fetch problem must never block or fail the review itself."""
+        if not self.cfg.review.read_prior_comments:
+            return []
+        try:
+            issue = self.gh.get_issue_comments(pr.repo, pr.number)
+            review = self.gh.get_review_comments(pr.repo, pr.number)
+        except GhError as e:
+            log.warning("prior-comment fetch failed repo=%s pr=%s: %s", pr.repo, pr.number, e)
+            return []
+        return list(issue) + list(review)
+
     # -- multi-pass pipeline --------------------------------------------
-    def _review_multi(self, pr: PullRequest, fd, user_prompt: str, ts: str, model: str, dry_run: bool = False) -> ReviewOutcome:
+    def _review_multi(self, pr: PullRequest, fd, user_prompt: str, ts: str, model: str, dry_run: bool = False, prior_ctx: str = "") -> ReviewOutcome:
         """Fan out diff-only review lenses, dedup, score each finding for
         confidence, then synthesize + post. All model calls run in a thread pool;
         store/bus writes happen only here on the main thread."""
@@ -228,7 +250,7 @@ class ReviewOrchestrator:
         survivors: list = []
         scored_total = 0
         if findings:
-            scored = self._map_parallel(findings, lambda f: self._score_finding(f, pr, fd, rc.scoring_votes))
+            scored = self._map_parallel(findings, lambda f: self._score_finding(f, pr, fd, rc.scoring_votes, prior_ctx))
             for f, conf, reason, score_usages in scored:
                 usages.extend(score_usages)
                 if conf is None:
@@ -314,12 +336,13 @@ class ReviewOrchestrator:
         )
         return LensResult(lens=lens, findings=tuple(found), usage=res.usage, ok=True, raw=res.content, coverage=coverage)
 
-    def _score_finding(self, finding, pr, fd, votes: int):
+    def _score_finding(self, finding, pr, fd, votes: int, prior_ctx: str = ""):
         """Score one finding with ``votes`` independent calls; return
-        ``(finding, median_confidence|None, reason, [usages])``."""
+        ``(finding, median_confidence|None, reason, [usages])``. ``prior_ctx`` lets
+        the scorer return 0 for a finding already raised in the PR's discussion."""
         agent = f"score:#{finding.id}"
         self._emit_agent(pr, agent, "running", f"{finding.severity} {finding.file}")
-        user = build_scoring_user_prompt(pr, fd, finding)
+        user = build_scoring_user_prompt(pr, fd, finding, prior_context=prior_ctx)
         confs: list[int] = []
         reason = ""
         usages: list[Usage] = []

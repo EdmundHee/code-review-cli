@@ -74,6 +74,10 @@ review:
     - maintainability
     - test_coverage
   max_parallel: 0                     # cap concurrent model calls; 0 = unbounded
+  read_prior_comments: true           # feed the PR's existing comments (bot + human,
+                                      # timeline + inline) back as context, and let the
+                                      # scorer suppress issues already raised. false to disable.
+  prior_comment_max_chars: 6000       # budget for the rendered prior-discussion block
 
 storage:
   db_path: ~/.local/state/ghcr/ghcr.db

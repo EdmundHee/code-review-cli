@@ -15,6 +15,9 @@ review as a comment using a **dedicated bot GitHub account**.
 - Reviews each PR on open **and on every new push**, deduped by head SHA (each
   unique commit reviewed once). State lives in SQLite.
 - Posts one **summary comment per reviewed commit** with a hidden marker.
+- Reads the PR's **existing comments** (its own earlier reviews + human remarks,
+  timeline + inline) first, so it won't re-raise issues already raised and stays
+  aware of the discussion. Toggle with `review.read_prior_comments` (default on).
 - Skips drafts, ignored authors, and its own PRs; skips noisy files and caps
   diff size + a rolling 24h USD budget.
 

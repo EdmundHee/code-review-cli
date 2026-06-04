@@ -20,7 +20,14 @@ Keep new pure logic in a pure module so it stays unit-testable without network o
 ## Review pipeline
 
 `review.mode` (config) selects the path; both share the prefix
-`decide() → fetch diff → byte cap → filter_diff → empty check`.
+`decide() → fetch diff → byte cap → filter_diff → empty check → fetch prior PR comments`.
+
+**Prior-comment context.** After the empty check, `_fetch_prior_comments` pulls the PR's
+existing issue-timeline + inline review comments (best-effort) and `prior_context.build_prior_context`
+renders one capped, newest-first block. It is injected into every lens user prompt (discussion
+context) and every scoring user prompt — where the scorer returns confidence 0 for a finding
+**already raised** by the bot on an earlier commit or by a human (no extra model calls; suppression
+rides the existing scoring pass). Off via `review.read_prior_comments`; sized by `prior_comment_max_chars`.
 
 - **single** — one DeepSeek call with `SYSTEM_PROMPT`. The legacy path; tests pin to it.
 - **multi** (default) — accuracy-first, modeled on Claude Code's `/code-review`, adapted to
@@ -48,6 +55,9 @@ Keep new pure logic in a pure module so it stays unit-testable without network o
 - **Robust JSON parsing.** The thinking model wraps JSON in fences and prose. `pipeline`
   parsers strip fences, fall back to the first balanced block, validate per-element, and
   return `None` only on total failure — a bad lens degrades to empty findings, never raises.
+- **Prior-comment fetch is best-effort.** `_fetch_prior_comments` wraps the `gh` calls in
+  `try/except GhError → []`; a comment-fetch failure degrades to an empty context block and
+  must never block or fail the review. `prior_context` parsers skip junk, never raise.
 - **Dataclasses are frozen.** Use `dataclasses.replace`, never mutate.
 - **Lazy `openai` import.** `deepseek.py` imports the SDK inside `__init__` so pure modules
   import without it. Keep it lazy.

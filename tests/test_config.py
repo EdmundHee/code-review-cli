@@ -117,6 +117,23 @@ def test_review_rejects_zero_votes(tmp_path):
         load_config(_write(tmp_path, text), env={}, resolve_secrets=False)
 
 
+def test_review_prior_comment_defaults(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID), env={}, resolve_secrets=False)
+    assert cfg.review.read_prior_comments is True
+    assert cfg.review.prior_comment_max_chars == 6000
+
+
+def test_review_prior_comments_parsed_and_clamped(tmp_path):
+    text = VALID + (
+        "review:\n"
+        "  read_prior_comments: false\n"
+        "  prior_comment_max_chars: -5\n"
+    )
+    cfg = load_config(_write(tmp_path, text), env={}, resolve_secrets=False)
+    assert cfg.review.read_prior_comments is False
+    assert cfg.review.prior_comment_max_chars == 0  # clamped to >= 0
+
+
 # -- merge_reloadable (hot-reload) -------------------------------------------
 
 def test_merge_swaps_safe_fields_no_restart(tmp_path):

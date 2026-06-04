@@ -28,6 +28,22 @@ class PullRequest:
 
 
 @dataclass(frozen=True)
+class PriorComment:
+    """One existing comment on the PR, fed back to the reviewer as context.
+
+    ``kind`` is "issue" (PR conversation timeline — where the bot's own past
+    reviews land) or "review" (inline, anchored to a diff line). ``path``/``line``
+    are set only for the inline kind."""
+
+    author: str
+    body: str
+    created_at: str = ""
+    kind: str = "issue"  # "issue" | "review"
+    path: str = ""
+    line: int | None = None
+
+
+@dataclass(frozen=True)
 class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0

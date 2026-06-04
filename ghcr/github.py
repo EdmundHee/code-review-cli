@@ -12,7 +12,8 @@ import json
 import os
 import subprocess
 
-from .models import PullRequest
+from .models import PriorComment, PullRequest
+from .prior_context import parse_issue_comments, parse_review_comments
 
 _PR_JSON_FIELDS = (
     "number,headRefOid,isDraft,author,url,title,additions,deletions,"
@@ -96,6 +97,40 @@ class GhClient:
         # by the caller on the returned string; for v1 that is an acceptable
         # OOM risk for pathological (tens-of-MB) generated-file PRs.
         return self._run(["--repo", repo, "pr", "diff", str(number), "--patch"])
+
+    def _api_jsonl(self, path: str, jq: str) -> list[dict]:
+        """Run a paginated ``gh api ... --jq`` whose filter emits one compact JSON
+        object per line, and parse each line. Unparseable lines are skipped so a
+        single odd row never sinks the batch."""
+        out = self._run(["api", "--paginate", path, "--jq", jq])
+        rows: list[dict] = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+        return rows
+
+    def get_issue_comments(self, repo: str, number: int) -> list[PriorComment]:
+        """The PR conversation timeline — this is where the bot's own past reviews
+        (posted via ``pr comment``) and humans' top-level remarks live."""
+        rows = self._api_jsonl(
+            f"repos/{repo}/issues/{number}/comments",
+            ".[] | {login: .user.login, body: .body, created_at: .created_at}",
+        )
+        return parse_issue_comments(rows)
+
+    def get_review_comments(self, repo: str, number: int) -> list[PriorComment]:
+        """Inline review comments anchored to specific diff lines."""
+        rows = self._api_jsonl(
+            f"repos/{repo}/pulls/{number}/comments",
+            ".[] | {login: .user.login, body: .body, created_at: .created_at, "
+            "path: .path, line: .line, original_line: .original_line}",
+        )
+        return parse_review_comments(rows)
 
     def post_comment(self, repo: str, number: int, body: str) -> str:
         out = self._run(

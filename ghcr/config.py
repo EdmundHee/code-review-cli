@@ -98,6 +98,8 @@ class ReviewModeConfig:
     confidence_threshold: int  # keep findings scored >= this (0-100)
     scoring_votes: int  # independent score calls per finding; median is taken
     max_parallel: int  # cap on concurrent model calls; 0 = unbounded
+    read_prior_comments: bool = True  # feed the PR's existing comments back as context
+    prior_comment_max_chars: int = 6000  # budget for the rendered prior-discussion block
 
 
 @dataclass(frozen=True)
@@ -181,6 +183,8 @@ def _parse_review(review: dict) -> "ReviewModeConfig":
         confidence_threshold=threshold,
         scoring_votes=votes,
         max_parallel=max_parallel,
+        read_prior_comments=bool(review.get("read_prior_comments", True)),
+        prior_comment_max_chars=max(0, int(review.get("prior_comment_max_chars", 6000))),
     )
 
 
