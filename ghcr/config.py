@@ -100,6 +100,7 @@ class ReviewModeConfig:
     max_parallel: int  # cap on concurrent model calls; 0 = unbounded
     read_prior_comments: bool = True  # feed the PR's existing comments back as context
     prior_comment_max_chars: int = 6000  # budget for the rendered prior-discussion block
+    rereview_on_mention: bool = True  # a new comment @mentioning the bot triggers a fresh review
 
 
 @dataclass(frozen=True)
@@ -185,6 +186,7 @@ def _parse_review(review: dict) -> "ReviewModeConfig":
         max_parallel=max_parallel,
         read_prior_comments=bool(review.get("read_prior_comments", True)),
         prior_comment_max_chars=max(0, int(review.get("prior_comment_max_chars", 6000))),
+        rereview_on_mention=bool(review.get("rereview_on_mention", True)),
     )
 
 

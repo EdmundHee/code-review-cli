@@ -10,6 +10,7 @@ The package is split into **pure modules** (no I/O, no SDK, trivially testable) 
 
 - **Pure:** `models.py` (frozen dataclasses + `merge_usages`), `prompts.py` (prompt strings),
   `pipeline.py` (JSON parsing, dedup, test-file classification, markdown synthesis),
+  `prior_context.py` (parse PR comments, render context block, `find_mention_triggers`),
   `diff_filter.py`, `cost.py`, `comment.py`.
 - **I/O:** `review.py` (`ReviewOrchestrator` — the composition root), `deepseek.py`
   (OpenAI-compatible client), `github.py` (`gh` CLI wrapper), `state.py` (SQLite),
@@ -22,7 +23,16 @@ Keep new pure logic in a pure module so it stays unit-testable without network o
 `review.mode` (config) selects the path; both share the prefix
 `decide() → fetch diff → byte cap → filter_diff → empty check → fetch prior PR comments`.
 
-**Prior-comment context.** After the empty check, `_fetch_prior_comments` pulls the PR's
+**Two triggers.** (1) **Head SHA** — the poller reviews each PR once per unique head SHA
+(`decide()` → `already_reviewed`). (2) **@mention** — after `review_pr`, the poller calls
+`orch.rereview_if_mentioned(pr, just_reviewed=...)`: a new comment containing `@{bot_login}`
+(non-bot author, id past the `comment_triggers` watermark) fires a full re-review via
+`review_pr(trigger="mention")`. First sight of a PR baselines the watermark silently (no fire on
+historical @mentions). A mention re-review records outcome **`rereviewed`** — distinct from
+`reviewed` so it sidesteps the `WHERE outcome='reviewed'` unique index and is NOT in `SEEN_OUTCOMES`
+(head-SHA logic untouched), but still counts toward the budget. Off via `review.rereview_on_mention`.
+
+**Prior-comment context.** After the empty check, `_fetch_pr_comments` pulls the PR's
 existing issue-timeline + inline review comments (best-effort) and `prior_context.build_prior_context`
 renders one capped, newest-first block. It is injected into every lens user prompt (discussion
 context) and every scoring user prompt — where the scorer returns confidence 0 for a finding
@@ -55,9 +65,9 @@ rides the existing scoring pass). Off via `review.read_prior_comments`; sized by
 - **Robust JSON parsing.** The thinking model wraps JSON in fences and prose. `pipeline`
   parsers strip fences, fall back to the first balanced block, validate per-element, and
   return `None` only on total failure — a bad lens degrades to empty findings, never raises.
-- **Prior-comment fetch is best-effort.** `_fetch_prior_comments` wraps the `gh` calls in
-  `try/except GhError → []`; a comment-fetch failure degrades to an empty context block and
-  must never block or fail the review. `prior_context` parsers skip junk, never raise.
+- **Comment fetch is best-effort.** `_fetch_pr_comments` wraps the `gh` calls in
+  `try/except GhError → []`; a fetch failure degrades to an empty context block / no @mention
+  trigger and must never block or fail the review. `prior_context` parsers skip junk, never raise.
 - **Dataclasses are frozen.** Use `dataclasses.replace`, never mutate.
 - **Lazy `openai` import.** `deepseek.py` imports the SDK inside `__init__` so pure modules
   import without it. Keep it lazy.

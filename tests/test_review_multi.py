@@ -214,3 +214,71 @@ def test_read_prior_comments_disabled_skips_fetch(tmp_path):
     orch.review_pr(make_pr())
     assert gh.comment_calls == 0
     assert all("PRIOR PR DISCUSSION" not in u for u in ds.user_for("## LENS: correctness"))
+
+
+# -- @mention-triggered re-review -------------------------------------------
+def _mention(cid, author="alice"):
+    return PriorComment(author=author, body="@reviewbot please take another look",
+                        created_at="2026-06-01T00:00:00Z", comment_id=cid)
+
+
+def test_mention_first_sight_baselines_without_firing(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF, issue_comments=[_mention(10)])
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds)
+    out = orch.rereview_if_mentioned(make_pr(), just_reviewed=False)
+    assert out is None              # first sight only baselines
+    assert gh.posted == []
+    assert store.last_mention_id("owner/repo", 1) == 10
+
+
+def test_mention_fires_rereview_past_watermark(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF, issue_comments=[_mention(10)])
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds)
+    store.set_mention_id("owner/repo", 1, 0)  # not first sight
+    out = orch.rereview_if_mentioned(make_pr(), just_reviewed=False)
+    assert out is not None and out.action == "review"
+    body = gh.posted[0][2]
+    assert "Re-review" in body and "@alice" in body
+    assert store.recent(1)[0]["outcome"] == "rereviewed"
+    assert store.last_mention_id("owner/repo", 1) == 10
+
+
+def test_mention_not_refired_next_cycle(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF, issue_comments=[_mention(10)])
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds)
+    store.set_mention_id("owner/repo", 1, 0)
+    orch.rereview_if_mentioned(make_pr(), just_reviewed=False)  # fires, wm→10
+    n = len(gh.posted)
+    out2 = orch.rereview_if_mentioned(make_pr(), just_reviewed=False)  # same comment
+    assert out2 is None and len(gh.posted) == n
+
+
+def test_bot_own_mention_does_not_fire(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF, issue_comments=[_mention(10, author="reviewbot")])
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds)
+    store.set_mention_id("owner/repo", 1, 0)
+    out = orch.rereview_if_mentioned(make_pr(), just_reviewed=False)
+    assert out is None and gh.posted == []
+    assert store.last_mention_id("owner/repo", 1) == 10  # watermark still advances
+
+
+def test_just_reviewed_advances_watermark_without_firing(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF, issue_comments=[_mention(10)])
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds)
+    store.set_mention_id("owner/repo", 1, 0)
+    out = orch.rereview_if_mentioned(make_pr(), just_reviewed=True)
+    assert out is None and gh.posted == []
+    assert store.last_mention_id("owner/repo", 1) == 10
+
+
+def test_rereview_disabled_skips_fetch_and_fire(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF, issue_comments=[_mention(10)])
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds, rereview_on_mention=False)
+    out = orch.rereview_if_mentioned(make_pr(), just_reviewed=False)
+    assert out is None and gh.comment_calls == 0 and gh.posted == []

@@ -43,6 +43,7 @@ def make_config(
     test_globs=("**/test_*.py", "**/tests/**"),
     read_prior_comments: bool = True,
     prior_comment_max_chars: int = 6000,
+    rereview_on_mention: bool = True,
 ) -> Config:
     return Config(
         github=GithubConfig(gh_path="/usr/bin/true", token="t", bot_login=bot_login, request_timeout_seconds=60),
@@ -74,6 +75,7 @@ def make_config(
             max_parallel=max_parallel,
             read_prior_comments=read_prior_comments,
             prior_comment_max_chars=prior_comment_max_chars,
+            rereview_on_mention=rereview_on_mention,
         ),
         db_path=db_path,
         log_level="INFO",

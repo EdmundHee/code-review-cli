@@ -23,6 +23,7 @@ from .diff_filter import filter_diff
 from .github import GhError
 from .models import (
     ACTION_ERROR,
+    ACTION_REREVIEWED,
     ACTION_REVIEW,
     ACTION_SKIP_AUTHOR,
     ACTION_SKIP_BUDGET,
@@ -44,7 +45,7 @@ from .pipeline import (
     parse_score,
     synthesize_markdown,
 )
-from .prior_context import build_prior_context
+from .prior_context import build_prior_context, find_mention_triggers, max_comment_id
 from .prompts import (
     LENS_PROMPTS,
     SCORING_SYSTEM_PROMPT,
@@ -89,16 +90,20 @@ class ReviewOrchestrator:
         return ReviewDecision(ACTION_REVIEW, "")
 
     # -- full pipeline ---------------------------------------------------
-    def review_pr(self, pr: PullRequest, dry_run: bool = False) -> ReviewOutcome:
+    def review_pr(self, pr: PullRequest, dry_run: bool = False, trigger: str = "push",
+                  prior_comments=None, trigger_note: str = "") -> ReviewOutcome:
         # dry_run bypasses the skip gates (the operator picked this PR on purpose)
         # and never posts or records — it builds the review and returns the body.
-        if not dry_run:
+        # trigger="mention" is an @mention re-review: skip the head-SHA seen-gate
+        # (caller already decided to act) and record a distinct outcome.
+        if not dry_run and trigger == "push":
             decision = self.decide(pr)
             if decision.action != ACTION_REVIEW:
                 return ReviewOutcome(decision.action)  # transient skip: no DB row
 
         ts = self._now().strftime("%Y-%m-%dT%H:%MZ")
         model = self.cfg.deepseek.model
+        record_outcome = ACTION_REREVIEWED if trigger == "mention" else "reviewed"
 
         raw = self.gh.get_pr_diff(pr.repo, pr.number)
         if len(raw.encode("utf-8")) > self.cfg.diff.max_diff_bytes:
@@ -113,15 +118,22 @@ class ReviewOrchestrator:
             return ReviewOutcome(ACTION_SKIP_EMPTY)
 
         # Existing PR conversation as context (best-effort; failure → empty block).
+        # A mention re-review passes the comments it already fetched, to avoid a re-fetch.
+        if self.cfg.review.read_prior_comments:
+            comments = prior_comments if prior_comments is not None else self._fetch_pr_comments(pr)
+        else:
+            comments = []
         prior_ctx = build_prior_context(
-            self._fetch_prior_comments(pr),
+            comments,
             bot_login=self.cfg.github.bot_login,
             max_chars=self.cfg.review.prior_comment_max_chars,
         )
         user_prompt = build_user_prompt(pr, fd, prior_context=prior_ctx)
 
         if self.cfg.review.mode == "multi":
-            return self._review_multi(pr, fd, user_prompt, ts, model, dry_run=dry_run, prior_ctx=prior_ctx)
+            return self._review_multi(pr, fd, user_prompt, ts, model, dry_run=dry_run,
+                                      prior_ctx=prior_ctx, record_outcome=record_outcome,
+                                      trigger_note=trigger_note)
 
         est_tokens = estimate_input_tokens(SYSTEM_PROMPT + user_prompt)
         if est_tokens > self.cfg.diff.per_run_input_token_cap:
@@ -163,6 +175,7 @@ class ReviewOrchestrator:
             kept_files=len(fd.kept_paths),
             skipped_files=fd.skipped_paths,
             changed_lines=fd.changed_lines,
+            trigger_note=trigger_note,
         )
 
         if dry_run:
@@ -177,28 +190,52 @@ class ReviewOrchestrator:
             return ReviewOutcome(ACTION_ERROR)
 
         self.store.record(
-            pr.repo, pr.number, pr.head_sha, "reviewed",
+            pr.repo, pr.number, pr.head_sha, record_outcome,
             comment_url=url, usage=result.usage, cost_usd=cost, model=model,
         )
         return ReviewOutcome(ACTION_REVIEW, cost_usd=cost, comment_url=url)
 
-    def _fetch_prior_comments(self, pr: PullRequest):
-        """Existing PR comments (issue timeline + inline review) as review context.
-
-        Best-effort: disabled by config, or any ``gh`` failure, yields ``[]`` — a
-        comment-fetch problem must never block or fail the review itself."""
-        if not self.cfg.review.read_prior_comments:
-            return []
+    def _fetch_pr_comments(self, pr: PullRequest):
+        """Existing PR comments (issue timeline + inline review). Best-effort: any
+        ``gh`` failure yields ``[]`` — a comment-fetch problem must never block or
+        fail the review. NOT gated by config; callers apply their own feature toggle."""
         try:
             issue = self.gh.get_issue_comments(pr.repo, pr.number)
             review = self.gh.get_review_comments(pr.repo, pr.number)
         except GhError as e:
-            log.warning("prior-comment fetch failed repo=%s pr=%s: %s", pr.repo, pr.number, e)
+            log.warning("comment fetch failed repo=%s pr=%s: %s", pr.repo, pr.number, e)
             return []
         return list(issue) + list(review)
 
+    def rereview_if_mentioned(self, pr: PullRequest, just_reviewed: bool = False) -> ReviewOutcome | None:
+        """Fire a full re-review when a new comment @mentions the bot.
+
+        Watermark (``store.last_mention_id``) dedups across cycles. First sight of a
+        PR baselines silently (never fires on historical @mentions — avoids a deploy
+        storm). ``just_reviewed`` True means the head-SHA path already produced a
+        comment-aware review this cycle, so we advance the watermark without firing.
+        """
+        if not self.cfg.review.rereview_on_mention:
+            return None
+        comments = self._fetch_pr_comments(pr)
+        top = max_comment_id(comments)
+        wm = self.store.last_mention_id(pr.repo, pr.number)
+        if wm is None:
+            self.store.set_mention_id(pr.repo, pr.number, top)  # baseline, no fire
+            return None
+        new = find_mention_triggers(comments, bot_login=self.cfg.github.bot_login, after_id=wm)
+        outcome = None
+        if new and not just_reviewed:
+            latest = max(new, key=lambda c: c.comment_id)
+            note = f"Re-review requested by @{latest.author}" if latest.author else "Re-review requested"
+            log.info("re-review triggered by @mention repo=%s pr=%s by=%s", pr.repo, pr.number, latest.author)
+            outcome = self.review_pr(pr, trigger="mention", prior_comments=comments, trigger_note=note)
+        self.store.set_mention_id(pr.repo, pr.number, max(wm, top))
+        return outcome
+
     # -- multi-pass pipeline --------------------------------------------
-    def _review_multi(self, pr: PullRequest, fd, user_prompt: str, ts: str, model: str, dry_run: bool = False, prior_ctx: str = "") -> ReviewOutcome:
+    def _review_multi(self, pr: PullRequest, fd, user_prompt: str, ts: str, model: str, dry_run: bool = False,
+                      prior_ctx: str = "", record_outcome: str = "reviewed", trigger_note: str = "") -> ReviewOutcome:
         """Fan out diff-only review lenses, dedup, score each finding for
         confidence, then synthesize + post. All model calls run in a thread pool;
         store/bus writes happen only here on the main thread."""
@@ -278,6 +315,7 @@ class ReviewOrchestrator:
         body = comment_mod.build_comment(
             content=content, pr=pr, model=model, timestamp=ts,
             kept_files=len(fd.kept_paths), skipped_files=fd.skipped_paths, changed_lines=fd.changed_lines,
+            trigger_note=trigger_note,
         )
 
         if dry_run:
@@ -292,7 +330,7 @@ class ReviewOrchestrator:
             return ReviewOutcome(ACTION_ERROR, cost_usd=cost)
 
         self.store.record(
-            pr.repo, pr.number, pr.head_sha, "reviewed",
+            pr.repo, pr.number, pr.head_sha, record_outcome,
             comment_url=url, usage=usage, cost_usd=cost, model=model,
         )
         return ReviewOutcome(ACTION_REVIEW, cost_usd=cost, comment_url=url)

@@ -16,7 +16,7 @@ import yaml
 from .config import Config, ConfigError, load_config, merge_reloadable
 from .events import ConfigReloaded, CycleStarted, PrOutcome, RepoDone, RepoListed
 from .github import GhError
-from .models import ACTION_ERROR
+from .models import ACTION_ERROR, ACTION_REVIEW
 
 log = logging.getLogger("ghcr.poller")
 
@@ -155,6 +155,19 @@ class PollLoop:
                             cost_usd=outcome.cost_usd, comment_url=outcome.comment_url,
                             title=pr.title, head_sha=pr.head_sha,
                         ))
+                    # Second trigger: a new @mention summons a fresh review even on an
+                    # unchanged head SHA. Skip firing if we just reviewed this cycle.
+                    re_out = self.orch.rereview_if_mentioned(
+                        pr, just_reviewed=(outcome.action == ACTION_REVIEW)
+                    )
+                    if re_out is not None:
+                        log.info("repo=%s pr=%d action=rereview cost=$%.4f", repo, pr.number, re_out.cost_usd)
+                        if self.bus:
+                            self.bus.publish(PrOutcome(
+                                repo=repo, pr_number=pr.number, action=re_out.action,
+                                cost_usd=re_out.cost_usd, comment_url=re_out.comment_url,
+                                title=pr.title, head_sha=pr.head_sha,
+                            ))
                 except Exception as e:  # isolate: one PR must not kill the loop
                     log.exception("review crashed repo=%s pr=%d", repo, pr.number)
                     try:

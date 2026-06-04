@@ -134,6 +134,14 @@ def test_review_prior_comments_parsed_and_clamped(tmp_path):
     assert cfg.review.prior_comment_max_chars == 0  # clamped to >= 0
 
 
+def test_review_rereview_on_mention_default_and_parsed(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID), env={}, resolve_secrets=False)
+    assert cfg.review.rereview_on_mention is True  # default on
+    text = VALID + "review:\n  rereview_on_mention: false\n"
+    cfg2 = load_config(_write(tmp_path, text), env={}, resolve_secrets=False)
+    assert cfg2.review.rereview_on_mention is False
+
+
 # -- merge_reloadable (hot-reload) -------------------------------------------
 
 def test_merge_swaps_safe_fields_no_restart(tmp_path):

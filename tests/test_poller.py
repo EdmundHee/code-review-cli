@@ -3,7 +3,7 @@ import dataclasses
 import pytest
 
 from ghcr.events import ConfigReloaded, EventBus, RepoDone, RepoListed
-from ghcr.models import ACTION_SKIP_SEEN
+from ghcr.models import ACTION_REVIEW, ACTION_SKIP_SEEN
 from ghcr.poller import PollLoop, baseline_if_first_run, preflight
 from ghcr.review import ReviewOutcome
 from ghcr.state import StateStore
@@ -16,6 +16,9 @@ class _Orch:
     def __init__(self, cfg):
         self.cfg = cfg
         self.store = None
+
+    def rereview_if_mentioned(self, pr, just_reviewed=False):
+        return None  # no-op; the @mention path is exercised separately below
 
 
 def test_preflight_ok_case_insensitive(tmp_path):
@@ -151,3 +154,36 @@ def test_run_once_emits_repo_done_per_repo_including_skip_seen(tmp_path):
     done = {e.repo for e in seen if isinstance(e, RepoDone)}
     assert listed == {"owner/a", "owner/b"}
     assert done == {"owner/a", "owner/b"}  # RepoDone fires despite skip_seen-only PRs
+
+
+# -- @mention re-review hook -------------------------------------------------
+class _RecordingOrch(_Orch):
+    """Records review_pr outcome + how the poller calls rereview_if_mentioned."""
+
+    def __init__(self, cfg, action):
+        super().__init__(cfg)
+        self._action = action
+        self.rereview_calls: list = []
+
+    def review_pr(self, pr):
+        return ReviewOutcome(self._action)
+
+    def rereview_if_mentioned(self, pr, just_reviewed=False):
+        self.rereview_calls.append((pr.number, just_reviewed))
+        return None
+
+
+def test_poller_calls_rereview_with_just_reviewed_false_on_skip_seen(tmp_path):
+    cfg = make_config(db_path=str(tmp_path / "db"))
+    orch = _RecordingOrch(cfg, action=ACTION_SKIP_SEEN)
+    loop = PollLoop(orch, FakeGhClient(prs=[make_pr(number=1)]), cfg)
+    loop.run_once()
+    assert orch.rereview_calls == [(1, False)]  # nothing fresh → mention path may fire
+
+
+def test_poller_calls_rereview_with_just_reviewed_true_when_reviewed(tmp_path):
+    cfg = make_config(db_path=str(tmp_path / "db"))
+    orch = _RecordingOrch(cfg, action=ACTION_REVIEW)
+    loop = PollLoop(orch, FakeGhClient(prs=[make_pr(number=2)]), cfg)
+    loop.run_once()
+    assert orch.rereview_calls == [(2, True)]  # fresh review already done → don't double-fire

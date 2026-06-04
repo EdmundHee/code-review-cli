@@ -41,6 +41,7 @@ class PriorComment:
     kind: str = "issue"  # "issue" | "review"
     path: str = ""
     line: int | None = None
+    comment_id: int = 0  # GitHub comment id; the @mention re-review watermark keys on it
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,7 @@ class LensResult:
 
 # Terminal action constants — recorded once per head SHA, block future re-review.
 ACTION_REVIEW = "review"
+ACTION_REREVIEWED = "rereviewed"  # @mention-triggered re-review; NOT in the seen-set
 ACTION_SKIP_SEEN = "skip_seen"
 ACTION_SKIP_DRAFT = "skip_draft"
 ACTION_SKIP_AUTHOR = "skip_author"
