@@ -35,8 +35,9 @@ review_policy:
 
 diff:
   max_diff_bytes: 400000              # raw-read + post-filter cap
-  per_run_input_token_cap: 250000     # cost/context gate (chars/4 estimate)
+  per_run_input_token_cap: 250000     # context-size gate (chars/4); in multi it caps the SUM over lenses
   oversized_behavior: notice          # notice | skip
+  # test_globs: paths the test_coverage lens treats as tests (omit to use built-in defaults)
   skip_globs:
     - "**/*.lock"
     - "**/package-lock.json"
@@ -59,6 +60,26 @@ diff:
 budgets:
   daily_usd_budget: 5.00              # rolling 24h ceiling across all reviews
   budget_exceeded_behavior: notice    # notice | skip
+
+review:
+  mode: multi                         # multi (default, accurate) | single (one call)
+  # multi runs each lens as its own model call, then scores EVERY finding — so it
+  # costs roughly (lenses + findings*scoring_votes)x a single review. That is the
+  # intended trade: accuracy over cost.
+  confidence_threshold: 80            # keep only findings scored >= this (0-100)
+  scoring_votes: 1                    # score each finding N times; median is kept (odd N)
+  lenses:                             # omit to use all; test_coverage drives the verdict
+    - correctness
+    - security
+    - maintainability
+    - test_coverage
+  max_parallel: 0                     # cap concurrent model calls; 0 = unbounded
+  read_prior_comments: true           # feed the PR's existing comments (bot + human,
+                                      # timeline + inline) back as context, and let the
+                                      # scorer suppress issues already raised. false to disable.
+  prior_comment_max_chars: 6000       # budget for the rendered prior-discussion block
+  rereview_on_mention: true           # a new comment that @mentions the bot triggers a fresh
+                                      # full review (no new commit needed). false to disable.
 
 storage:
   db_path: ~/.local/state/ghcr/ghcr.db

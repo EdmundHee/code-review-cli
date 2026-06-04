@@ -26,6 +26,18 @@ class RepoListed:
 
 
 @dataclass(frozen=True)
+class RepoDone:
+    """A repo finished its poll this cycle (PRs reviewed/skipped, or list failed).
+
+    Marks the end boundary of working a repo so the TUI can clear the active
+    highlight and stamp "last polled" freshness. Carries no duration — the TUI
+    computes time-since-poll from when this arrives.
+    """
+
+    repo: str
+
+
+@dataclass(frozen=True)
 class DeepSeekDone:
     repo: str
     pr_number: int
@@ -37,6 +49,22 @@ class DeepSeekDone:
 
 
 @dataclass(frozen=True)
+class AgentEvent:
+    """One multi-pass sub-agent (a lens or a per-finding scorer) changing state.
+
+    Published from the review thread pool, so it must stay pure data — the bus is
+    thread-safe and the TUI only mutates in-memory state on receipt.
+    """
+
+    repo: str
+    pr_number: int
+    agent: str  # "lens:security" | "score:#3"
+    status: str  # "running" | "done" | "failed"
+    detail: str = ""
+    title: str = ""
+
+
+@dataclass(frozen=True)
 class PrOutcome:
     repo: str
     pr_number: int
@@ -44,6 +72,14 @@ class PrOutcome:
     cost_usd: float = 0.0
     comment_url: str | None = None
     title: str = ""
+    head_sha: str = ""
+
+
+@dataclass(frozen=True)
+class ConfigReloaded:
+    repos: tuple[str, ...]
+    interval_s: int
+    budget: float
 
 
 @dataclass(frozen=True)

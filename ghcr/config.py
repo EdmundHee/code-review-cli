@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import yaml
 
 from .cost import Prices
+from .prompts import LENS_NAMES
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
@@ -34,6 +35,20 @@ _DEFAULT_SKIP_GLOBS = [
     "**/*.png",
     "**/*.jpg",
     "**/*.pdf",
+]
+
+# Path globs treated as test files by the test_coverage lens's pre-signal.
+_DEFAULT_TEST_GLOBS = [
+    "**/test_*.py",
+    "**/*_test.py",
+    "**/tests/**",
+    "**/__tests__/**",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/*_spec.rb",
+    "**/*Test.java",
+    "**/*Tests.cs",
+    "**/*_test.go",
 ]
 
 
@@ -73,6 +88,23 @@ class DiffConfig:
     per_run_input_token_cap: int
     skip_globs: tuple[str, ...]
     oversized_behavior: str  # "notice" | "skip"
+    test_globs: tuple[str, ...] = tuple(_DEFAULT_TEST_GLOBS)
+
+
+@dataclass(frozen=True)
+class ReviewModeConfig:
+    mode: str  # "single" | "multi"
+    lenses: tuple[str, ...]
+    confidence_threshold: int  # keep findings scored >= this (0-100)
+    scoring_votes: int  # independent score calls per finding; median is taken
+    max_parallel: int  # cap on concurrent model calls; 0 = unbounded
+    read_prior_comments: bool = True  # feed the PR's existing comments back as context
+    prior_comment_max_chars: int = 6000  # budget for the rendered prior-discussion block
+    rereview_on_mention: bool = True  # a new comment @mentioning the bot triggers a fresh review
+    fetch_referenced_context: bool = True  # multi: fetch defs of symbols the diff references
+    referenced_max_symbols: int = 6  # cap on symbols resolved per review
+    referenced_context_max_chars: int = 6000  # budget for the rendered referenced-defs block
+    referenced_search_limit: int = 5  # code-search results scanned per unresolved symbol
 
 
 @dataclass(frozen=True)
@@ -90,8 +122,29 @@ class Config:
     review_policy: ReviewPolicy
     diff: DiffConfig
     budgets: BudgetConfig
+    review: ReviewModeConfig
     db_path: str
     log_level: str
+
+
+# Fields safe to swap into a running loop (read fresh every cycle/PR). The rest
+# bind something at startup that a live swap won't touch: github/deepseek/db_path
+# construct a client or store, and log_level is applied once via logging.basicConfig
+# (nothing re-runs setLevel on reload), so all of them need a restart to take effect.
+_RELOADABLE = ("repos", "poll_interval_seconds", "review_policy", "diff", "budgets", "review")
+_RESTART_ONLY = ("github", "deepseek", "db_path", "log_level")
+
+
+def merge_reloadable(old: Config, new: Config) -> tuple[Config, list[str]]:
+    """Return ``old`` with hot-reloadable fields taken from ``new``.
+
+    Restart-only fields (github/deepseek/db_path) are kept from ``old``; any that
+    differ in ``new`` are returned in the second element so the caller can warn a
+    restart is needed to apply them.
+    """
+    merged = replace(old, **{f: getattr(new, f) for f in _RELOADABLE})
+    changed = [f for f in _RESTART_ONLY if getattr(old, f) != getattr(new, f)]
+    return merged, changed
 
 
 def _require_env(env, name: str, what: str) -> str:
@@ -105,6 +158,44 @@ def _behavior(value, where: str) -> str:
     if value not in ("notice", "skip"):
         raise ConfigError(f"{where} must be 'notice' or 'skip', got {value!r}")
     return value
+
+
+def _parse_review(review: dict) -> "ReviewModeConfig":
+    mode = review.get("mode", "multi")  # accuracy-first default
+    if mode not in ("single", "multi"):
+        raise ConfigError(f"review.mode must be 'single' or 'multi', got {mode!r}")
+
+    lenses = review.get("lenses") or list(LENS_NAMES)
+    for name in lenses:
+        if name not in LENS_NAMES:
+            raise ConfigError(
+                f"unknown review lens {name!r} (valid: {', '.join(LENS_NAMES)})"
+            )
+
+    threshold = max(0, min(100, int(review.get("confidence_threshold", 80))))
+
+    votes = int(review.get("scoring_votes", 1))
+    if votes < 1:
+        raise ConfigError("review.scoring_votes must be >= 1")
+
+    max_parallel = int(review.get("max_parallel", 0))
+    if max_parallel < 0:
+        raise ConfigError("review.max_parallel must be >= 0 (0 = unbounded)")
+
+    return ReviewModeConfig(
+        mode=mode,
+        lenses=tuple(lenses),
+        confidence_threshold=threshold,
+        scoring_votes=votes,
+        max_parallel=max_parallel,
+        read_prior_comments=bool(review.get("read_prior_comments", True)),
+        prior_comment_max_chars=max(0, int(review.get("prior_comment_max_chars", 6000))),
+        rereview_on_mention=bool(review.get("rereview_on_mention", True)),
+        fetch_referenced_context=bool(review.get("fetch_referenced_context", True)),
+        referenced_max_symbols=max(0, int(review.get("referenced_max_symbols", 6))),
+        referenced_context_max_chars=max(0, int(review.get("referenced_context_max_chars", 6000))),
+        referenced_search_limit=max(1, int(review.get("referenced_search_limit", 5))),
+    )
 
 
 def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
@@ -123,6 +214,7 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
     rp = raw.get("review_policy", {}) or {}
     diff = raw.get("diff", {}) or {}
     budgets = raw.get("budgets", {}) or {}
+    review = raw.get("review", {}) or {}
     poll = raw.get("poll", {}) or {}
     storage = raw.get("storage", {}) or {}
     logging_cfg = raw.get("logging", {}) or {}
@@ -177,11 +269,13 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
     )
 
     skip_globs = diff.get("skip_globs") or _DEFAULT_SKIP_GLOBS
+    test_globs = diff.get("test_globs") or _DEFAULT_TEST_GLOBS
     diff_cfg = DiffConfig(
         max_diff_bytes=int(diff.get("max_diff_bytes", 400_000)),
         per_run_input_token_cap=int(diff.get("per_run_input_token_cap", 250_000)),
         skip_globs=tuple(str(g) for g in skip_globs),
         oversized_behavior=_behavior(diff.get("oversized_behavior", "notice"), "diff.oversized_behavior"),
+        test_globs=tuple(str(g) for g in test_globs),
     )
     budget_cfg = BudgetConfig(
         daily_usd_budget=float(budgets.get("daily_usd_budget", 5.0)),
@@ -189,6 +283,8 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
             budgets.get("budget_exceeded_behavior", "notice"), "budgets.budget_exceeded_behavior"
         ),
     )
+
+    review_cfg = _parse_review(review)
 
     return Config(
         github=github_cfg,
@@ -198,6 +294,7 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
         review_policy=review_policy,
         diff=diff_cfg,
         budgets=budget_cfg,
+        review=review_cfg,
         db_path=os.path.expanduser(storage.get("db_path", "~/.local/state/ghcr/ghcr.db")),
         log_level=str(logging_cfg.get("level", "INFO")).upper(),
     )

@@ -6,6 +6,7 @@ import cycles.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 
@@ -27,10 +28,41 @@ class PullRequest:
 
 
 @dataclass(frozen=True)
+class PriorComment:
+    """One existing comment on the PR, fed back to the reviewer as context.
+
+    ``kind`` is "issue" (PR conversation timeline — where the bot's own past
+    reviews land) or "review" (inline, anchored to a diff line). ``path``/``line``
+    are set only for the inline kind."""
+
+    author: str
+    body: str
+    created_at: str = ""
+    kind: str = "issue"  # "issue" | "review"
+    path: str = ""
+    line: int | None = None
+    comment_id: int = 0  # GitHub comment id; the @mention re-review watermark keys on it
+
+
+@dataclass(frozen=True)
 class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+
+
+def merge_usages(usages: Iterable[Usage]) -> Usage:
+    """Sum a sequence of per-call Usage objects into one aggregate.
+
+    Pure — the multi-pass pipeline calls the model many times (lenses + per-finding
+    scoring) and totals their token counts here before a single cost calculation.
+    """
+    p = c = t = 0
+    for u in usages:
+        p += u.prompt_tokens
+        c += u.completion_tokens
+        t += u.total_tokens
+    return Usage(prompt_tokens=p, completion_tokens=c, total_tokens=t)
 
 
 @dataclass(frozen=True)
@@ -40,8 +72,76 @@ class ReviewResult:
     model: str
 
 
+# -- referenced-context fetch (multi-pass) ----------------------------------
+@dataclass(frozen=True)
+class ContextRequest:
+    """One symbol the planner pass asks to see defined before reviewing. ``module_hint``
+    is whatever the diff revealed about where it lives (an import or dotted path); it may
+    be empty, in which case resolution falls back to code search."""
+
+    symbol: str
+    module_hint: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ReferencedSnippet:
+    """One resolved definition fetched from the repo, fed back to the reviewer as
+    authoritative ground truth for code the diff references but does not show."""
+
+    symbol: str
+    path: str
+    text: str
+
+
+# -- multi-pass review pipeline types --------------------------------------
+# Severities a finding may carry, ordered most→least severe (drives grouping).
+SEVERITY_ORDER = ("BLOCKER", "WARNING", "MINOR")
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One issue raised by a review lens. ``confidence``/``reason`` are filled by
+    the scoring pass; ``id`` is assigned after merge/dedup to correlate scores."""
+
+    severity: str  # BLOCKER | WARNING | MINOR
+    file: str
+    area: str = ""
+    issue: str = ""
+    fix: str = ""
+    lens: str = ""
+    confidence: int | None = None
+    reason: str = ""
+    id: int = 0
+
+
+@dataclass(frozen=True)
+class CoverageVerdict:
+    """The test_coverage lens's structured read on whether the PR ships tests for
+    the behavior it changes. ``has_tests`` True also covers 'no tests needed'.
+
+    Named without a ``Test`` prefix so pytest does not try to collect it."""
+
+    has_tests: bool
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class LensResult:
+    """One lens's outcome. ``ok`` False means the call or its JSON parse failed —
+    findings are then empty but ``usage`` may still be non-zero (we paid for it)."""
+
+    lens: str
+    findings: tuple[Finding, ...]
+    usage: Usage
+    ok: bool
+    raw: str = ""
+    coverage: TestCoverageVerdict | None = None
+
+
 # Terminal action constants — recorded once per head SHA, block future re-review.
 ACTION_REVIEW = "review"
+ACTION_REREVIEWED = "rereviewed"  # @mention-triggered re-review; NOT in the seen-set
 ACTION_SKIP_SEEN = "skip_seen"
 ACTION_SKIP_DRAFT = "skip_draft"
 ACTION_SKIP_AUTHOR = "skip_author"
