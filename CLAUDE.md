@@ -82,8 +82,11 @@ usage is aggregated into the review cost. This is the one place multi relaxes di
   parsers strip fences, fall back to the first balanced block, validate per-element, and
   return `None` only on total failure — a bad lens degrades to empty findings, never raises.
 - **Comment fetch is best-effort.** `_fetch_pr_comments` wraps the `gh` calls in
-  `try/except GhError → []`; a fetch failure degrades to an empty context block / no @mention
-  trigger and must never block or fail the review. `prior_context` parsers skip junk, never raise.
+  `try/except GhError → None` (**`None` = fetch failed, distinct from `[]` = genuinely no
+  comments**); a fetch failure must never block or fail the review. `review_pr` coerces `None → []`
+  (empty context block). `rereview_if_mentioned` treats `None` as "skip this cycle, retry next" so
+  a failed **first-sight** fetch never baselines the watermark at 0 (which would replay every
+  historical @mention once the fetch recovers). `prior_context` parsers skip junk, never raise.
 - **Referenced-context fetch is best-effort.** `_fetch_referenced_context` / `_resolve_symbol`
   wrap the planner call (`try/except DeepSeekError`) and each `gh` call (`try/except GhError`);
   any failure degrades to an empty block and the review proceeds diff-only — a fetch must never

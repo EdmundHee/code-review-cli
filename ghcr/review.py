@@ -129,7 +129,7 @@ class ReviewOrchestrator:
         # Existing PR conversation as context (best-effort; failure → empty block).
         # A mention re-review passes the comments it already fetched, to avoid a re-fetch.
         if self.cfg.review.read_prior_comments:
-            comments = prior_comments if prior_comments is not None else self._fetch_pr_comments(pr)
+            comments = prior_comments if prior_comments is not None else (self._fetch_pr_comments(pr) or [])
         else:
             comments = []
         prior_ctx = build_prior_context(
@@ -206,14 +206,16 @@ class ReviewOrchestrator:
 
     def _fetch_pr_comments(self, pr: PullRequest):
         """Existing PR comments (issue timeline + inline review). Best-effort: any
-        ``gh`` failure yields ``[]`` — a comment-fetch problem must never block or
-        fail the review. NOT gated by config; callers apply their own feature toggle."""
+        ``gh`` failure yields ``None`` (distinct from ``[]`` = genuinely no comments)
+        so callers can tell a fetch error from an empty PR — a comment-fetch problem
+        must never block or fail the review. NOT gated by config; callers apply their
+        own feature toggle."""
         try:
             issue = self.gh.get_issue_comments(pr.repo, pr.number)
             review = self.gh.get_review_comments(pr.repo, pr.number)
         except GhError as e:
             log.warning("comment fetch failed repo=%s pr=%s: %s", pr.repo, pr.number, e)
-            return []
+            return None
         return list(issue) + list(review)
 
     def _fetch_referenced_context(self, pr: PullRequest, fd) -> tuple[str, list[Usage]]:
@@ -268,12 +270,17 @@ class ReviewOrchestrator:
 
         Watermark (``store.last_mention_id``) dedups across cycles. First sight of a
         PR baselines silently (never fires on historical @mentions — avoids a deploy
-        storm). ``just_reviewed`` True means the head-SHA path already produced a
-        comment-aware review this cycle, so we advance the watermark without firing.
+        storm). A failed comment fetch (``None``) skips the cycle entirely, so a
+        transient error at first sight never baselines at 0 and replays every historical
+        @mention once the fetch recovers. ``just_reviewed`` True means the head-SHA path
+        already produced a comment-aware review this cycle, so we advance the watermark
+        without firing.
         """
         if not self.cfg.review.rereview_on_mention:
             return None
         comments = self._fetch_pr_comments(pr)
+        if comments is None:  # fetch failed — can't baseline or detect; retry next cycle
+            return None
         top = max_comment_id(comments)
         wm = self.store.last_mention_id(pr.repo, pr.number)
         if wm is None:
