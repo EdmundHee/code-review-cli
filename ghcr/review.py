@@ -34,9 +34,16 @@ from .models import (
     SEVERITY_ORDER,
     LensResult,
     PullRequest,
+    ReferencedSnippet,
     ReviewDecision,
     Usage,
     merge_usages,
+)
+from .context_request import (
+    extract_definition,
+    module_to_path,
+    parse_context_requests,
+    render_referenced_context,
 )
 from .pipeline import (
     classify_test_signal,
@@ -47,9 +54,11 @@ from .pipeline import (
 )
 from .prior_context import build_prior_context, find_mention_triggers, max_comment_id
 from .prompts import (
+    CONTEXT_REQUEST_PROMPT,
     LENS_PROMPTS,
     SCORING_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
+    build_context_request_user_prompt,
     build_scoring_user_prompt,
     build_user_prompt,
     coverage_hint,
@@ -207,6 +216,53 @@ class ReviewOrchestrator:
             return []
         return list(issue) + list(review)
 
+    def _fetch_referenced_context(self, pr: PullRequest, fd) -> tuple[str, list[Usage]]:
+        """Resolve the definitions of symbols the diff references but does not define.
+
+        A planner model call lists the symbols; each is resolved to repo source (hint or
+        code search) and fetched at the PR head SHA. Returns the rendered block + the
+        planner's usage. Best-effort and gated by config: disabled or any failure yields
+        ``("", [])`` so the review proceeds diff-only — a fetch must never fail a review."""
+        rc = self.cfg.review
+        if not rc.fetch_referenced_context:
+            return "", []
+        try:
+            res = self.deepseek.review(CONTEXT_REQUEST_PROMPT, build_context_request_user_prompt(pr, fd))
+        except DeepSeekError as e:
+            log.warning("context planner failed repo=%s pr=%s: %s", pr.repo, pr.number, e)
+            return "", []
+        requests = parse_context_requests(res.content)[: rc.referenced_max_symbols]
+        snippets = [s for s in (self._resolve_symbol(pr, req) for req in requests) if s]
+        block = render_referenced_context(snippets, max_chars=rc.referenced_context_max_chars)
+        return block, [res.usage]
+
+    def _resolve_symbol(self, pr: PullRequest, req) -> ReferencedSnippet | None:
+        """Resolve one ContextRequest to a ReferencedSnippet, or None. Hybrid: try the
+        module hint's path, else code search; fetch at the head SHA; slice the definition.
+        Every ``gh`` call is best-effort — a GhError just means the symbol is unresolved."""
+        text, path = None, None
+        hint_path = module_to_path(req.module_hint)
+        if hint_path:
+            try:
+                text, path = self.gh.get_file_content(pr.repo, hint_path, pr.head_sha), hint_path
+            except GhError:
+                text = None
+        if text is None:
+            try:
+                hits = self.gh.search_code(pr.repo, req.symbol, self.cfg.review.referenced_search_limit)
+            except GhError:
+                hits = []
+            path = hits[0].get("path") if hits and isinstance(hits[0], dict) else None
+            if path:
+                try:
+                    text = self.gh.get_file_content(pr.repo, path, pr.head_sha)
+                except GhError:
+                    text = None
+        if not text or not path:
+            return None
+        body = extract_definition(text, req.symbol)
+        return ReferencedSnippet(symbol=req.symbol, path=path, text=body) if body else None
+
     def rereview_if_mentioned(self, pr: PullRequest, just_reviewed: bool = False) -> ReviewOutcome | None:
         """Fire a full re-review when a new comment @mentions the bot.
 
@@ -260,11 +316,18 @@ class ReviewOrchestrator:
         t0 = time.monotonic()
         has_source, has_test = classify_test_signal(fd, self.cfg.diff.test_globs)
 
+        # Fetch the real definitions of symbols the diff references but does not show,
+        # so the lenses + scorer judge against ground truth instead of guessing. Best-
+        # effort and gated by config; on any failure the review proceeds diff-only.
+        ref_ctx, ref_usages = self._fetch_referenced_context(pr, fd)
+        if ref_ctx:
+            user_prompt = build_user_prompt(pr, fd, prior_context=prior_ctx, referenced_context=ref_ctx)
+
         lens_results: list[LensResult] = self._map_parallel(
             lenses, lambda ln: self._run_one_lens(ln, pr, fd, user_prompt, has_source, has_test)
         )
 
-        usages: list[Usage] = [lr.usage for lr in lens_results]
+        usages: list[Usage] = list(ref_usages) + [lr.usage for lr in lens_results]
         lens_errors = [lr.lens for lr in lens_results if not lr.ok]
         coverage = next((lr.coverage for lr in lens_results if lr.coverage is not None), None)
         raw_findings = [f for lr in lens_results if lr.ok for f in lr.findings]
@@ -287,7 +350,7 @@ class ReviewOrchestrator:
         survivors: list = []
         scored_total = 0
         if findings:
-            scored = self._map_parallel(findings, lambda f: self._score_finding(f, pr, fd, rc.scoring_votes, prior_ctx))
+            scored = self._map_parallel(findings, lambda f: self._score_finding(f, pr, fd, rc.scoring_votes, prior_ctx, ref_ctx))
             for f, conf, reason, score_usages in scored:
                 usages.extend(score_usages)
                 if conf is None:
@@ -374,13 +437,14 @@ class ReviewOrchestrator:
         )
         return LensResult(lens=lens, findings=tuple(found), usage=res.usage, ok=True, raw=res.content, coverage=coverage)
 
-    def _score_finding(self, finding, pr, fd, votes: int, prior_ctx: str = ""):
+    def _score_finding(self, finding, pr, fd, votes: int, prior_ctx: str = "", referenced_ctx: str = ""):
         """Score one finding with ``votes`` independent calls; return
         ``(finding, median_confidence|None, reason, [usages])``. ``prior_ctx`` lets
-        the scorer return 0 for a finding already raised in the PR's discussion."""
+        the scorer return 0 for a finding already raised in the PR's discussion;
+        ``referenced_ctx`` supplies the fetched definitions it scores against."""
         agent = f"score:#{finding.id}"
         self._emit_agent(pr, agent, "running", f"{finding.severity} {finding.file}")
-        user = build_scoring_user_prompt(pr, fd, finding, prior_context=prior_ctx)
+        user = build_scoring_user_prompt(pr, fd, finding, prior_context=prior_ctx, referenced_context=referenced_ctx)
         confs: list[int] = []
         reason = ""
         usages: list[Usage] = []

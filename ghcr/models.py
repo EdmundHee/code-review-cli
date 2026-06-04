@@ -72,6 +72,28 @@ class ReviewResult:
     model: str
 
 
+# -- referenced-context fetch (multi-pass) ----------------------------------
+@dataclass(frozen=True)
+class ContextRequest:
+    """One symbol the planner pass asks to see defined before reviewing. ``module_hint``
+    is whatever the diff revealed about where it lives (an import or dotted path); it may
+    be empty, in which case resolution falls back to code search."""
+
+    symbol: str
+    module_hint: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ReferencedSnippet:
+    """One resolved definition fetched from the repo, fed back to the reviewer as
+    authoritative ground truth for code the diff references but does not show."""
+
+    symbol: str
+    path: str
+    text: str
+
+
 # -- multi-pass review pipeline types --------------------------------------
 # Severities a finding may carry, ordered most→least severe (drives grouping).
 SEVERITY_ORDER = ("BLOCKER", "WARNING", "MINOR")

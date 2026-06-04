@@ -1,9 +1,11 @@
 from ghcr.diff_filter import FilteredDiff
 from ghcr.models import Finding
 from ghcr.prompts import (
+    CONTEXT_REQUEST_PROMPT,
     LENS_NAMES,
     LENS_PROMPTS,
     SCORING_SYSTEM_PROMPT,
+    build_context_request_user_prompt,
     build_scoring_user_prompt,
     build_user_prompt,
     coverage_hint,
@@ -71,3 +73,47 @@ def test_build_scoring_user_prompt_includes_prior_block_when_given():
 
 def test_scoring_prompt_instructs_suppression_of_already_raised():
     assert "already raised" in SCORING_SYSTEM_PROMPT.lower()
+
+
+# -- referenced-context injection + planner pass ----------------------------
+def test_build_user_prompt_omits_referenced_block_by_default():
+    assert "REFERENCED DEFINITIONS" not in build_user_prompt(make_pr(), _fd())
+
+
+def test_build_user_prompt_includes_referenced_block_when_given():
+    block = "## REFERENCED DEFINITIONS\nclass BaseConnector: ...\n"
+    out = build_user_prompt(make_pr(), _fd(), referenced_context=block)
+    assert "REFERENCED DEFINITIONS" in out and "BaseConnector" in out and "THE DIFF" in out
+
+
+def test_build_scoring_user_prompt_includes_referenced_block_when_given():
+    f = Finding(severity="WARNING", file="a.py", area="g", issue="bug", fix="x", lens="correctness")
+    out = build_scoring_user_prompt(make_pr(), _fd(), f, referenced_context="REF-MARK-XYZ")
+    assert "REF-MARK-XYZ" in out and "bug" in out
+
+
+def test_context_request_prompt_has_route_header_and_requests_shape():
+    assert "## PASS: context" in CONTEXT_REQUEST_PROMPT
+    assert "requests" in CONTEXT_REQUEST_PROMPT
+
+
+def test_build_context_request_user_prompt_includes_diff():
+    assert "THE DIFF" in build_context_request_user_prompt(make_pr(), _fd())
+
+
+def test_lens_findings_spec_ties_blocker_to_evidence():
+    p = LENS_PROMPTS["correctness"]
+    assert "BLOCKER" in p
+    assert "referenced definitions" in p.lower()  # severity rubric cites the fetched evidence
+
+
+def test_lens_base_treats_referenced_definitions_as_authoritative():
+    p = LENS_PROMPTS["correctness"]
+    assert "referenced definitions" in p.lower()
+    assert "authoritative" in p.lower()
+
+
+def test_scoring_prompt_caps_confidence_on_unverifiable_symbols():
+    low = SCORING_SYSTEM_PROMPT.lower()
+    assert "referenced definitions" in low
+    assert "cap confidence at 25" in low
