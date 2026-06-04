@@ -42,6 +42,24 @@ def test_build_comment_has_marker_and_footer():
     assert "verify before acting" in body
 
 
+def test_build_comment_renders_trigger_note():
+    body = build_comment(
+        content="## Summary\nok", pr=PR, model="m", timestamp="t",
+        kept_files=1, skipped_files=[], changed_lines=1,
+        trigger_note="Re-review requested by @alice",
+    )
+    assert "Re-review requested by @alice" in body
+    assert SHA in extract_marker_shas(body)  # marker still present
+
+
+def test_build_comment_omits_trigger_note_by_default():
+    body = build_comment(
+        content="x", pr=PR, model="m", timestamp="t",
+        kept_files=1, skipped_files=[], changed_lines=1,
+    )
+    assert "Re-review requested" not in body
+
+
 def test_notice_comment_has_marker():
     body = build_notice_comment(
         kind="oversized", pr=PR, model="m", timestamp="t", detail="too big"

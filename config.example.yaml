@@ -78,6 +78,8 @@ review:
                                       # timeline + inline) back as context, and let the
                                       # scorer suppress issues already raised. false to disable.
   prior_comment_max_chars: 6000       # budget for the rendered prior-discussion block
+  rereview_on_mention: true           # a new comment that @mentions the bot triggers a fresh
+                                      # full review (no new commit needed). false to disable.
 
 storage:
   db_path: ~/.local/state/ghcr/ghcr.db

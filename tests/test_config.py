@@ -134,6 +134,37 @@ def test_review_prior_comments_parsed_and_clamped(tmp_path):
     assert cfg.review.prior_comment_max_chars == 0  # clamped to >= 0
 
 
+def test_review_rereview_on_mention_default_and_parsed(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID), env={}, resolve_secrets=False)
+    assert cfg.review.rereview_on_mention is True  # default on
+    text = VALID + "review:\n  rereview_on_mention: false\n"
+    cfg2 = load_config(_write(tmp_path, text), env={}, resolve_secrets=False)
+    assert cfg2.review.rereview_on_mention is False
+
+
+def test_review_referenced_context_defaults(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID), env={}, resolve_secrets=False)
+    assert cfg.review.fetch_referenced_context is True  # on by default
+    assert cfg.review.referenced_max_symbols == 6
+    assert cfg.review.referenced_context_max_chars == 6000
+    assert cfg.review.referenced_search_limit == 5
+
+
+def test_review_referenced_context_parsed_and_clamped(tmp_path):
+    text = VALID + (
+        "review:\n"
+        "  fetch_referenced_context: false\n"
+        "  referenced_max_symbols: -3\n"
+        "  referenced_context_max_chars: -5\n"
+        "  referenced_search_limit: 0\n"
+    )
+    cfg = load_config(_write(tmp_path, text), env={}, resolve_secrets=False)
+    assert cfg.review.fetch_referenced_context is False
+    assert cfg.review.referenced_max_symbols == 0       # clamped >= 0
+    assert cfg.review.referenced_context_max_chars == 0  # clamped >= 0
+    assert cfg.review.referenced_search_limit == 1       # clamped >= 1
+
+
 # -- merge_reloadable (hot-reload) -------------------------------------------
 
 def test_merge_swaps_safe_fields_no_restart(tmp_path):

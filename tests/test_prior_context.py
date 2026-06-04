@@ -2,6 +2,8 @@ from ghcr.comment import marker
 from ghcr.models import PriorComment
 from ghcr.prior_context import (
     build_prior_context,
+    find_mention_triggers,
+    max_comment_id,
     parse_issue_comments,
     parse_review_comments,
 )
@@ -86,3 +88,49 @@ def test_build_prior_context_truncates_long_body():
     comments = [PriorComment(author="a", body="x" * 5000, created_at="2026-06-03T00:00:00Z")]
     out = build_prior_context(comments, bot_login="z", max_chars=10000)
     assert "…" in out and ("x" * 5000) not in out
+
+
+# -- @mention trigger detection ---------------------------------------------
+def test_parse_issue_comments_captures_comment_id():
+    raw = [{"login": "alice", "body": "hi", "created_at": "2026-06-01T00:00:00Z", "id": 12345}]
+    assert parse_issue_comments(raw)[0].comment_id == 12345
+
+
+def test_parse_review_comments_captures_comment_id():
+    raw = [{"login": "bob", "body": "x", "path": "a.py", "line": 1, "id": 999}]
+    assert parse_review_comments(raw)[0].comment_id == 999
+
+
+def test_find_mention_triggers_matches_human_mention():
+    comments = [
+        PriorComment(author="alice", body="hey @reviewbot please re-review", comment_id=5),
+        PriorComment(author="bob", body="unrelated remark", comment_id=6),
+    ]
+    out = find_mention_triggers(comments, bot_login="reviewbot", after_id=0)
+    assert [c.comment_id for c in out] == [5]
+
+
+def test_find_mention_triggers_ignores_bot_own_mention():
+    comments = [PriorComment(author="reviewbot", body="@reviewbot self ref", comment_id=5)]
+    assert find_mention_triggers(comments, bot_login="reviewbot", after_id=0) == []
+
+
+def test_find_mention_triggers_respects_after_id():
+    comments = [
+        PriorComment(author="alice", body="@reviewbot one", comment_id=3),
+        PriorComment(author="alice", body="@reviewbot two", comment_id=8),
+    ]
+    out = find_mention_triggers(comments, bot_login="reviewbot", after_id=5)
+    assert [c.comment_id for c in out] == [8]
+
+
+def test_find_mention_triggers_case_insensitive():
+    comments = [PriorComment(author="alice", body="HEY @ReviewBot", comment_id=2)]
+    assert find_mention_triggers(comments, bot_login="reviewbot", after_id=0)
+
+
+def test_max_comment_id():
+    comments = [PriorComment(author="a", body="x", comment_id=3),
+                PriorComment(author="b", body="y", comment_id=9)]
+    assert max_comment_id(comments) == 9
+    assert max_comment_id([]) == 0

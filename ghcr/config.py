@@ -100,6 +100,11 @@ class ReviewModeConfig:
     max_parallel: int  # cap on concurrent model calls; 0 = unbounded
     read_prior_comments: bool = True  # feed the PR's existing comments back as context
     prior_comment_max_chars: int = 6000  # budget for the rendered prior-discussion block
+    rereview_on_mention: bool = True  # a new comment @mentioning the bot triggers a fresh review
+    fetch_referenced_context: bool = True  # multi: fetch defs of symbols the diff references
+    referenced_max_symbols: int = 6  # cap on symbols resolved per review
+    referenced_context_max_chars: int = 6000  # budget for the rendered referenced-defs block
+    referenced_search_limit: int = 5  # code-search results scanned per unresolved symbol
 
 
 @dataclass(frozen=True)
@@ -185,6 +190,11 @@ def _parse_review(review: dict) -> "ReviewModeConfig":
         max_parallel=max_parallel,
         read_prior_comments=bool(review.get("read_prior_comments", True)),
         prior_comment_max_chars=max(0, int(review.get("prior_comment_max_chars", 6000))),
+        rereview_on_mention=bool(review.get("rereview_on_mention", True)),
+        fetch_referenced_context=bool(review.get("fetch_referenced_context", True)),
+        referenced_max_symbols=max(0, int(review.get("referenced_max_symbols", 6))),
+        referenced_context_max_chars=max(0, int(review.get("referenced_context_max_chars", 6000))),
+        referenced_search_limit=max(1, int(review.get("referenced_search_limit", 5))),
     )
 
 

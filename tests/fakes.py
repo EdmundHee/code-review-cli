@@ -43,6 +43,13 @@ def make_config(
     test_globs=("**/test_*.py", "**/tests/**"),
     read_prior_comments: bool = True,
     prior_comment_max_chars: int = 6000,
+    rereview_on_mention: bool = True,
+    # Referenced-context fetch defaults OFF in tests so existing multi-pass
+    # call-count assertions stay stable; production defaults ON (see config.py).
+    fetch_referenced_context: bool = False,
+    referenced_max_symbols: int = 6,
+    referenced_context_max_chars: int = 6000,
+    referenced_search_limit: int = 5,
 ) -> Config:
     return Config(
         github=GithubConfig(gh_path="/usr/bin/true", token="t", bot_login=bot_login, request_timeout_seconds=60),
@@ -74,6 +81,11 @@ def make_config(
             max_parallel=max_parallel,
             read_prior_comments=read_prior_comments,
             prior_comment_max_chars=prior_comment_max_chars,
+            rereview_on_mention=rereview_on_mention,
+            fetch_referenced_context=fetch_referenced_context,
+            referenced_max_symbols=referenced_max_symbols,
+            referenced_context_max_chars=referenced_context_max_chars,
+            referenced_search_limit=referenced_search_limit,
         ),
         db_path=db_path,
         log_level="INFO",
@@ -88,7 +100,8 @@ def make_pr(**kw) -> PullRequest:
 
 class FakeGhClient:
     def __init__(self, *, diff="", who="reviewbot", prs=None, post_raises=False,
-                 issue_comments=None, review_comments=None, comments_raise=False):
+                 issue_comments=None, review_comments=None, comments_raise=False,
+                 search_results=None, file_contents=None, code_raises=False):
         self.diff = diff
         self.who = who
         self.prs = prs or []
@@ -96,9 +109,16 @@ class FakeGhClient:
         self.issue_comments = issue_comments or []
         self.review_comments = review_comments or []
         self.comments_raise = comments_raise
+        # Referenced-context fetch doubles. search_results/file_contents key on the
+        # query/path, with "*" as a catch-all default; code_raises simulates GhError.
+        self.search_results = search_results or {}
+        self.file_contents = file_contents or {}
+        self.code_raises = code_raises
         self.posted: list[tuple[str, int, str]] = []
         self.diff_calls = 0
         self.comment_calls = 0
+        self.search_calls = 0
+        self.file_calls = 0
 
     def whoami(self):
         return self.who
@@ -124,6 +144,24 @@ class FakeGhClient:
     def get_pr_diff(self, repo, number):
         self.diff_calls += 1
         return self.diff
+
+    def search_code(self, repo, query, limit=5):
+        self.search_calls += 1
+        if self.code_raises:
+            raise GhError(["search", "code"], 1, "boom")
+        if query in self.search_results:
+            return list(self.search_results[query])
+        return list(self.search_results.get("*", []))
+
+    def get_file_content(self, repo, path, ref):
+        self.file_calls += 1
+        if self.code_raises:
+            raise GhError(["api", "contents"], 1, "boom")
+        if path in self.file_contents:
+            return self.file_contents[path]
+        if "*" in self.file_contents:
+            return self.file_contents["*"]
+        raise GhError(["api", "contents"], 1, "404 not found")
 
     def post_comment(self, repo, number, body):
         if self.post_raises:

@@ -1,0 +1,159 @@
+"""Referenced-context fetch (the planner pass + gh resolution) in the multi-pass review.
+
+These set fetch_referenced_context=True explicitly — the test make_config defaults it OFF
+so the broader multi-pass suite's call-count assertions stay stable.
+"""
+
+from datetime import datetime, timezone
+
+from ghcr.deepseek import DeepSeekError
+from ghcr.review import ReviewOrchestrator
+from ghcr.state import StateStore
+from tests.fakes import FakeDeepSeekClient, FakeGhClient, make_config, make_pr
+
+FIXED = datetime(2026, 5, 29, 12, 0, tzinfo=timezone.utc)
+
+# A diff that closes a connector then reuses it — the classic "use after close" smell
+# whose verdict actually depends on BaseConnector (defined elsewhere, not in the diff).
+SRC_DIFF = """\
+diff --git a/src/app.py b/src/app.py
+index 1..2 100644
+--- a/src/app.py
++++ b/src/app.py
+@@ -1,3 +1,4 @@
+ from db.base import BaseConnector
+ def f(c):
+-    return c.execute()
++    c.close()
++    return c.execute()
+"""
+
+CORR = '[{"severity":"BLOCKER","file":"src/app.py","area":"f","issue":"use after close","fix":"reconnect"}]'
+EMPTY = "[]"
+COV = '{"verdict":{"has_tests":false,"detail":"no test"},"findings":[]}'
+SCORE = '{"confidence":95,"reason":"x"}'
+PLANNER = '{"requests":[{"symbol":"BaseConnector","module_hint":"db.base","reason":"subclassed"}]}'
+BASE_SRC = (
+    "import os\n"
+    "\n"
+    "class BaseConnector:\n"
+    "    def close(self):\n"
+    "        self._c = None  # lazy: reconnects on next use\n"
+    "    def execute(self):\n"
+    "        return self._c.run()\n"
+)
+
+
+def _responses(*, corr=CORR, sec=EMPTY, maint=EMPTY, cov=COV, score=SCORE, planner=PLANNER):
+    return {
+        "## PASS: context": planner,
+        "## LENS: correctness": corr,
+        "## LENS: security": sec,
+        "## LENS: maintainability": maint,
+        "## LENS: test_coverage": cov,
+        "## PASS: scoring": score,
+    }
+
+
+def _orch(tmp_path, gh, ds, **cfg_kw):
+    cfg_kw.setdefault("fetch_referenced_context", True)
+    cfg = make_config(db_path=str(tmp_path / "ghcr.db"), review_mode="multi", **cfg_kw)
+    store = StateStore(cfg.db_path)
+    return ReviewOrchestrator(gh, ds, store, cfg, now=lambda: FIXED), store
+
+
+def test_referenced_context_reaches_lens_and_scoring_prompts(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"db/base.py": BASE_SRC})
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds)
+    out = orch.review_pr(make_pr())
+    assert out.action == "review"
+    assert ds.calls_matching("## PASS: context") == 1  # planner ran once
+    lens_users = ds.user_for("## LENS: correctness")
+    score_users = ds.user_for("## PASS: scoring")
+    assert lens_users and all("REFERENCED DEFINITIONS" in u for u in lens_users)
+    assert any("lazy: reconnects" in u for u in lens_users)  # the real def is in the prompt
+    assert score_users and all("REFERENCED DEFINITIONS" in u for u in score_users)
+    # resolved straight from the module hint (db.base -> db/base.py); no search needed
+    assert gh.file_calls == 1 and gh.search_calls == 0
+
+
+def test_planner_usage_counted_in_cost(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"db/base.py": BASE_SRC})
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds)
+    orch.review_pr(make_pr())
+    # planner(1) + 4 lenses + 1 score = 6 calls, each 1000/500 tokens
+    assert ds.calls == 6
+    row = store.recent(1)[0]
+    assert row["prompt_tokens"] == 6000 and row["completion_tokens"] == 3000
+
+
+def test_search_fallback_when_no_module_hint(tmp_path):
+    planner = '{"requests":[{"symbol":"BaseConnector","reason":"subclassed"}]}'  # no hint
+    gh = FakeGhClient(
+        diff=SRC_DIFF,
+        search_results={"BaseConnector": [{"path": "db/base.py"}]},
+        file_contents={"db/base.py": BASE_SRC},
+    )
+    ds = FakeDeepSeekClient(responses=_responses(planner=planner))
+    orch, store = _orch(tmp_path, gh, ds)
+    orch.review_pr(make_pr())
+    assert gh.search_calls == 1 and gh.file_calls == 1
+    assert any("class BaseConnector" in u for u in ds.user_for("## LENS: correctness"))
+
+
+def test_planner_failure_degrades_to_no_block(tmp_path):
+    def fail_planner(system, user):
+        raise DeepSeekError("planner down")
+
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"db/base.py": BASE_SRC})
+    ds = FakeDeepSeekClient(responses=_responses(planner=fail_planner))
+    orch, store = _orch(tmp_path, gh, ds)
+    out = orch.review_pr(make_pr())
+    assert out.action == "review"  # planner failure must not fail the review
+    assert all("REFERENCED DEFINITIONS" not in u for u in ds.user_for("## LENS: correctness"))
+    assert gh.file_calls == 0  # nothing parsed -> no resolution attempted
+
+
+def test_gh_failure_during_resolution_degrades(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF, code_raises=True)  # search + file both raise GhError
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds)
+    out = orch.review_pr(make_pr())
+    assert out.action == "review"  # gh failure must not fail the review
+    assert all("REFERENCED DEFINITIONS" not in u for u in ds.user_for("## LENS: correctness"))
+
+
+def test_unresolved_symbol_yields_no_block_but_still_reviews(tmp_path):
+    # planner asks for a symbol that neither hint nor search can locate
+    gh = FakeGhClient(diff=SRC_DIFF)  # no file_contents, empty search
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds)
+    out = orch.review_pr(make_pr())
+    assert out.action == "review"
+    assert all("REFERENCED DEFINITIONS" not in u for u in ds.user_for("## LENS: correctness"))
+
+
+def test_fetch_disabled_skips_planner_and_gh(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"db/base.py": BASE_SRC})
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds, fetch_referenced_context=False)
+    orch.review_pr(make_pr())
+    assert ds.calls_matching("## PASS: context") == 0
+    assert gh.search_calls == 0 and gh.file_calls == 0
+    assert all("REFERENCED DEFINITIONS" not in u for u in ds.user_for("## LENS: correctness"))
+
+
+def test_max_symbols_caps_resolution(tmp_path):
+    planner = (
+        '{"requests":['
+        '{"symbol":"A","module_hint":"db.a"},'
+        '{"symbol":"B","module_hint":"db.b"},'
+        '{"symbol":"C","module_hint":"db.c"}]}'
+    )
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"*": "class X:\n    pass\n"})
+    ds = FakeDeepSeekClient(responses=_responses(planner=planner))
+    orch, store = _orch(tmp_path, gh, ds, referenced_max_symbols=2)
+    orch.review_pr(make_pr())
+    assert gh.file_calls == 2  # only the first 2 of 3 requests resolved

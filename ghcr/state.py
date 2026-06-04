@@ -39,6 +39,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_unique
   ON reviews(repo, pr_number, head_sha) WHERE outcome='reviewed';
 CREATE INDEX IF NOT EXISTS idx_reviews_lookup ON reviews(repo, pr_number, head_sha);
 CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at);
+CREATE TABLE IF NOT EXISTS comment_triggers (
+  repo TEXT NOT NULL,
+  pr_number INTEGER NOT NULL,
+  last_comment_id INTEGER NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (repo, pr_number)
+);
 CREATE TABLE IF NOT EXISTS schema_meta (k TEXT PRIMARY KEY, v TEXT);
 """
 
@@ -117,6 +124,25 @@ class StateStore:
 
     def baseline_seen(self, pr: PullRequest, created_at: str | None = None) -> None:
         self.record(pr.repo, pr.number, pr.head_sha, "skip_baseline", created_at=created_at)
+
+    # -- @mention re-review watermark ------------------------------------
+    def last_mention_id(self, repo: str, number: int) -> int | None:
+        """Highest handled @mention comment id for a PR, or None if never scanned."""
+        row = self.conn.execute(
+            "SELECT last_comment_id FROM comment_triggers WHERE repo=? AND pr_number=?",
+            (repo, number),
+        ).fetchone()
+        return int(row["last_comment_id"]) if row is not None else None
+
+    def set_mention_id(self, repo: str, number: int, comment_id: int, created_at: str | None = None) -> None:
+        ts = created_at or _utcnow().isoformat()
+        self.conn.execute(
+            "INSERT INTO comment_triggers(repo, pr_number, last_comment_id, updated_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(repo, pr_number) DO UPDATE SET "
+            "last_comment_id=excluded.last_comment_id, updated_at=excluded.updated_at",
+            (repo, number, int(comment_id), ts),
+        )
+        self.conn.commit()
 
     def usd_spent_since(self, cutoff: datetime) -> float:
         row = self.conn.execute(

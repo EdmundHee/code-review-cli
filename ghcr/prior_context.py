@@ -18,6 +18,13 @@ from .models import PriorComment
 
 _BODY_CAP = 600  # per-comment body chars before truncation
 
+
+def _as_int(v) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
 _HEADER = (
     "## PRIOR PR DISCUSSION (most recent first)\n"
     "These are existing comments on this PR — this bot's previous automated "
@@ -41,6 +48,7 @@ def parse_issue_comments(raw) -> list[PriorComment]:
             body=body,
             created_at=str(el.get("created_at", "") or ""),
             kind="issue",
+            comment_id=_as_int(el.get("id")),
         ))
     return out
 
@@ -70,6 +78,7 @@ def parse_review_comments(raw) -> list[PriorComment]:
             kind="review",
             path=str(el.get("path", "") or "").strip(),
             line=line,
+            comment_id=_as_int(el.get("id")),
         ))
     return out
 
@@ -115,3 +124,22 @@ def build_prior_context(comments, *, bot_login: str, max_chars: int) -> str:
     if omitted:
         lines.append(f"\n({omitted} older comment{'s' if omitted != 1 else ''} omitted to fit the context budget)")
     return "\n".join(lines).strip() + "\n"
+
+
+# -- @mention re-review trigger detection -----------------------------------
+def find_mention_triggers(comments, *, bot_login: str, after_id: int) -> list[PriorComment]:
+    """Comments that should summon a fresh review: a non-bot author @mentions the
+    bot and the comment is newer than the watermark ``after_id``. Bot-authored
+    comments (incl. its own reviews) never qualify — loop-safety."""
+    needle = f"@{bot_login}".lower()
+    return [
+        c for c in comments
+        if c.comment_id > after_id
+        and not _is_bot(c, bot_login)
+        and needle in c.body.lower()
+    ]
+
+
+def max_comment_id(comments) -> int:
+    """Highest comment id seen (0 when empty) — the new watermark after a scan."""
+    return max((c.comment_id for c in comments), default=0)

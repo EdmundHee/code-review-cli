@@ -67,3 +67,45 @@ def test_survives_reopen(tmp_path):
     s2 = StateStore(path)
     assert s2.already_reviewed("o/r", 1, "a" * 40)
     assert s2.has_any()
+
+
+# -- @mention re-review: watermark + distinct outcome ------------------------
+def test_mention_watermark_roundtrip(tmp_path):
+    s = StateStore(_db(tmp_path))
+    assert s.last_mention_id("o/r", 1) is None  # unseen PR
+    s.set_mention_id("o/r", 1, 42)
+    assert s.last_mention_id("o/r", 1) == 42
+    s.set_mention_id("o/r", 1, 99)  # upsert advances
+    assert s.last_mention_id("o/r", 1) == 99
+
+
+def test_mention_watermark_survives_reopen(tmp_path):
+    path = _db(tmp_path)
+    s = StateStore(path)
+    s.set_mention_id("o/r", 3, 7)
+    s.close()
+    assert StateStore(path).last_mention_id("o/r", 3) == 7
+
+
+def test_rereviewed_coexists_with_reviewed_same_sha(tmp_path):
+    s = StateStore(_db(tmp_path))
+    s.record("o/r", 1, "a" * 40, "reviewed", cost_usd=1.0, model="m")
+    s.record("o/r", 1, "a" * 40, "rereviewed", cost_usd=2.0, model="m")
+    outcomes = sorted(r["outcome"] for r in s.recent(10))
+    assert outcomes == ["rereviewed", "reviewed"]  # both rows kept (no ON CONFLICT drop)
+    assert s.already_reviewed("o/r", 1, "a" * 40)  # 'reviewed' still marks SHA seen
+
+
+def test_rereviewed_not_in_seen_set(tmp_path):
+    s = StateStore(_db(tmp_path))
+    s.record("o/r", 2, "b" * 40, "rereviewed", cost_usd=1.0, model="m")
+    # a lone rereview must NOT mark the SHA seen (only head-SHA 'reviewed' does)
+    assert not s.already_reviewed("o/r", 2, "b" * 40)
+
+
+def test_rereviewed_counts_toward_spend(tmp_path):
+    s = StateStore(_db(tmp_path))
+    now = datetime(2026, 6, 4, 12, 0, tzinfo=timezone.utc)
+    s.record("o/r", 1, "a" * 40, "reviewed", cost_usd=1.0, created_at=now.isoformat())
+    s.record("o/r", 1, "a" * 40, "rereviewed", cost_usd=2.0, created_at=now.isoformat())
+    assert s.usd_spent_since(now - timedelta(hours=24)) == 3.0

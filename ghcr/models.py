@@ -41,6 +41,7 @@ class PriorComment:
     kind: str = "issue"  # "issue" | "review"
     path: str = ""
     line: int | None = None
+    comment_id: int = 0  # GitHub comment id; the @mention re-review watermark keys on it
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,28 @@ class ReviewResult:
     content: str
     usage: Usage
     model: str
+
+
+# -- referenced-context fetch (multi-pass) ----------------------------------
+@dataclass(frozen=True)
+class ContextRequest:
+    """One symbol the planner pass asks to see defined before reviewing. ``module_hint``
+    is whatever the diff revealed about where it lives (an import or dotted path); it may
+    be empty, in which case resolution falls back to code search."""
+
+    symbol: str
+    module_hint: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ReferencedSnippet:
+    """One resolved definition fetched from the repo, fed back to the reviewer as
+    authoritative ground truth for code the diff references but does not show."""
+
+    symbol: str
+    path: str
+    text: str
 
 
 # -- multi-pass review pipeline types --------------------------------------
@@ -118,6 +141,7 @@ class LensResult:
 
 # Terminal action constants — recorded once per head SHA, block future re-review.
 ACTION_REVIEW = "review"
+ACTION_REREVIEWED = "rereviewed"  # @mention-triggered re-review; NOT in the seen-set
 ACTION_SKIP_SEEN = "skip_seen"
 ACTION_SKIP_DRAFT = "skip_draft"
 ACTION_SKIP_AUTHOR = "skip_author"

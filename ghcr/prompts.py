@@ -69,15 +69,25 @@ errors, formatting, style) — assume CI runs these separately.
 If you are unsure whether something is real, do NOT invent it — omit it."""
 
 _LENS_BASE = """\
-You are a senior software engineer reviewing exactly ONE GitHub pull request. You see \
-only the unified diff plus PR metadata — you do NOT have the full repository, so never \
-assume code you cannot see and never ask for files. Stay strictly within your assigned \
-lens below; other reviewers cover other concerns, so do not duplicate them or pad."""
+You are a senior software engineer reviewing exactly ONE GitHub pull request. You see the \
+unified diff plus PR metadata and, when available, a "REFERENCED DEFINITIONS" section \
+holding the real source of key symbols the diff uses but does not define — treat those \
+definitions as authoritative ground truth. If judging a finding requires the behavior or \
+meaning of a symbol that is in NEITHER the diff NOR the referenced definitions, you cannot \
+verify it: do not assume how it "usually" behaves — either omit the finding or report it at \
+reduced severity (WARNING/MINOR) and say what you would need to confirm. Never ask for \
+files. Stay strictly within your assigned lens below; other reviewers cover other concerns, \
+so do not duplicate them or pad."""
 
 _LENS_FINDINGS_SPEC = """\
 Return ONLY a JSON array — no prose, no markdown fences. Each element is an object:
 {"severity": "BLOCKER" | "WARNING" | "MINOR", "file": "<path>", "area": "<symbol or hunk>", \
 "issue": "<what is wrong>", "fix": "<concrete suggested fix>"}
+Choose severity by what your EVIDENCE proves, not by how bad it would be if true:
+- BLOCKER: the diff (and any referenced definitions) directly prove a defect that breaks \
+correctness or security — no assumption about unseen code is required.
+- WARNING: likely a real issue, OR its severity hinges on context/behavior not fully shown.
+- MINOR: small or local, OR it rests on an assumption about code you were not given.
 If your lens finds nothing, return exactly []."""
 
 _LENS_FOCUS = {
@@ -138,7 +148,9 @@ def coverage_hint(has_source_changes: bool, has_test_changes: bool) -> str:
 SCORING_SYSTEM_PROMPT = """\
 ## PASS: scoring
 You are scoring ONE finding raised by a code reviewer against a GitHub pull request diff. \
-You see only the diff and the single finding. Rate your confidence that the finding is a \
+You see the diff, the single finding, and — when available — a REFERENCED DEFINITIONS \
+section with the real source of key symbols the diff uses but does not define; treat those \
+definitions as authoritative. Rate your confidence that the finding is a \
 REAL, worth-reporting issue, on this 0-100 scale (use it verbatim):
 - 0: Not confident at all. A false positive that does not survive light scrutiny, a \
 pre-existing issue on unchanged lines, or an issue ALREADY RAISED in the PRIOR PR \
@@ -151,7 +163,13 @@ relative to the PR it is not very important.
 - 75: Highly confident. You double-checked; very likely a real issue hit in practice, and \
 the PR's current approach is insufficient. Important to functionality.
 - 100: Absolutely certain. Confirmed a definite real issue that will happen frequently; the \
-diff itself is direct evidence.
+diff itself (or a referenced definition) is direct evidence.
+
+Crucial: if the finding depends on the behavior or meaning of a symbol that is in NEITHER \
+the diff NOR the referenced definitions — e.g. whether a called method leaves an object \
+unusable, whether a base class reconnects, or whether a field enforces a security rule — you \
+cannot verify it here. Cap confidence at 25 in that case: your prior knowledge of how such \
+code "usually" behaves is NOT evidence, only the diff and referenced definitions are.
 
 """ + _FALSE_POSITIVE_GUIDANCE + """
 
@@ -160,16 +178,54 @@ Return ONLY a JSON object — no prose, no markdown fences:
 """
 
 
+# Planner pass: names the unseen symbols whose definitions the reviewer must read.
+# review.py resolves each via gh and feeds the result back as REFERENCED DEFINITIONS.
+CONTEXT_REQUEST_PROMPT = """\
+## PASS: context
+You are preparing a code review of ONE GitHub pull request. You see only the unified diff. \
+Before the review, list the symbols whose DEFINITION must be read to judge the diff \
+correctly but which the diff does NOT itself define — e.g. a base class it subclasses, a \
+function or method it calls, a decorator it applies, or the type of a parameter/field whose \
+meaning matters to correctness or security. These are the things a reviewer would otherwise \
+have to GUESS about.
+
+For each, give the bare symbol name and, when the diff reveals where it comes from (an \
+import or a dotted module path), a module hint to help locate it. Skip anything the diff \
+already defines, language builtins/standard library, and trivial well-known helpers. Request \
+only the few that are load-bearing — fewer, decisive symbols beat a long speculative list.
+
+Return ONLY a JSON object — no prose, no markdown fences:
+{"requests": [{"symbol": "<name>", "module_hint": "<import or dotted path, or empty>", \
+"reason": "<why its definition matters to this diff>"}]}
+If the diff is self-contained, return {"requests": []}.
+"""
+
+
 def _prior_block(prior_context: str) -> str:
     """A blank-line-padded prior-discussion block, or '' when none was supplied."""
     return f"\n{prior_context.strip()}\n" if prior_context.strip() else ""
 
 
-def build_scoring_user_prompt(pr: PullRequest, fd: FilteredDiff, finding, prior_context: str = "") -> str:
+def _referenced_block(referenced_context: str) -> str:
+    """A blank-line-padded referenced-definitions block, or '' when none was supplied."""
+    return f"\n{referenced_context.strip()}\n" if referenced_context.strip() else ""
+
+
+def build_context_request_user_prompt(pr: PullRequest, fd: FilteredDiff) -> str:
+    """User payload for the planner pass: PR metadata + the diff to scan for the
+    unseen symbols whose definitions the reviewer needs."""
+    header = f"Repository: {pr.repo}\nPR #{pr.number}: {pr.title}\n"
+    return f"{header}\nUnified diff:\n```diff\n{fd.text}\n```\n"
+
+
+def build_scoring_user_prompt(
+    pr: PullRequest, fd: FilteredDiff, finding, prior_context: str = "", referenced_context: str = ""
+) -> str:
     """User payload for one scoring call: the finding under review + the diff.
 
-    When ``prior_context`` is supplied it is included so the scorer can return 0 for
-    a finding already raised in the PR's existing discussion (see SCORING_SYSTEM_PROMPT)."""
+    ``prior_context`` lets the scorer return 0 for a finding already raised in the PR's
+    discussion; ``referenced_context`` supplies the real definitions of symbols the diff
+    references, so the scorer can verify (or cap) the finding (see SCORING_SYSTEM_PROMPT)."""
     head = (
         f"Repository: {pr.repo}  PR #{pr.number}: {pr.title}\n\n"
         f"Finding to score (raised by the '{finding.lens}' lens):\n"
@@ -179,10 +235,16 @@ def build_scoring_user_prompt(pr: PullRequest, fd: FilteredDiff, finding, prior_
         f"- issue: {finding.issue}\n"
         f"- suggested fix: {finding.fix}\n"
     )
-    return f"{head}{_prior_block(prior_context)}\nUnified diff:\n```diff\n{fd.text}\n```\n"
+    return (
+        f"{head}{_referenced_block(referenced_context)}{_prior_block(prior_context)}"
+        f"\nUnified diff:\n```diff\n{fd.text}\n```\n"
+    )
 
 
-def build_user_prompt(pr: PullRequest, fd: FilteredDiff, truncated: bool = False, prior_context: str = "") -> str:
+def build_user_prompt(
+    pr: PullRequest, fd: FilteredDiff, truncated: bool = False,
+    prior_context: str = "", referenced_context: str = "",
+) -> str:
     skipped = ", ".join(fd.skipped_paths) if fd.skipped_paths else "none"
     header = (
         f"Repository: {pr.repo}\n"
@@ -195,4 +257,7 @@ def build_user_prompt(pr: PullRequest, fd: FilteredDiff, truncated: bool = False
     )
     if truncated:
         header += "NOTE: the diff was truncated due to size; review only what is shown.\n"
-    return f"{header}{_prior_block(prior_context)}\nUnified diff:\n```diff\n{fd.text}\n```\n"
+    return (
+        f"{header}{_referenced_block(referenced_context)}{_prior_block(prior_context)}"
+        f"\nUnified diff:\n```diff\n{fd.text}\n```\n"
+    )

@@ -40,13 +40,16 @@ def build_comment(
     skipped_files: list[str],
     changed_lines: int,
     truncated: bool = False,
+    trigger_note: str = "",
 ) -> str:
     short = pr.head_sha[:7]
     trunc = " · diff truncated" if truncated else ""
+    note = f"_{trigger_note}_\n\n" if trigger_note else ""
     return (
         f"{marker(pr.head_sha, model)}\n"
         f"### 🤖 Automated code review\n"
         f"`{model}` · commit `{short}` · {timestamp}\n\n"
+        f"{note}"
         f"{content.strip()}\n\n"
         f"---\n"
         f"<sub>GithubCodeReview bot · diff: {changed_lines} lines / {kept_files} files"
