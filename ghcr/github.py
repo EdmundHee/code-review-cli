@@ -64,14 +64,21 @@ class GhClient:
         return env
 
     def _run(self, args, input_text: str | None = None) -> str:
-        proc = subprocess.run(
-            [self.gh_path, *args],
-            input=input_text,
-            capture_output=True,
-            text=True,
-            env=self._child_env(),
-            timeout=self.timeout,
-        )
+        # A subprocess timeout is normalized to GhError (not raw TimeoutExpired)
+        # so callers' best-effort `except GhError` handlers catch it — a slow
+        # network must degrade a fetch, never hard-fail the review. Other OSErrors
+        # (e.g. a missing gh binary) are left to propagate: that's a config fault.
+        try:
+            proc = subprocess.run(
+                [self.gh_path, *args],
+                input=input_text,
+                capture_output=True,
+                text=True,
+                env=self._child_env(),
+                timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise GhError(args, -1, f"timed out after {self.timeout}s") from e
         if proc.returncode != 0:
             raise GhError(args, proc.returncode, (proc.stderr or "").strip())
         return proc.stdout
@@ -144,7 +151,7 @@ class GhClient:
         (posted via ``pr comment``) and humans' top-level remarks live."""
         rows = self._api_jsonl(
             f"repos/{repo}/issues/{number}/comments",
-            ".[] | {login: .user.login, body: .body, created_at: .created_at}",
+            ".[] | {id: .id, login: .user.login, body: .body, created_at: .created_at}",
         )
         return parse_issue_comments(rows)
 
@@ -152,7 +159,7 @@ class GhClient:
         """Inline review comments anchored to specific diff lines."""
         rows = self._api_jsonl(
             f"repos/{repo}/pulls/{number}/comments",
-            ".[] | {login: .user.login, body: .body, created_at: .created_at, "
+            ".[] | {id: .id, login: .user.login, body: .body, created_at: .created_at, "
             "path: .path, line: .line, original_line: .original_line}",
         )
         return parse_review_comments(rows)

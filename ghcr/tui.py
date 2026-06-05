@@ -203,24 +203,42 @@ def _header(state: DashboardState) -> Panel:
     return Panel(text, border_style="cyan")
 
 
+def _activity(state: DashboardState, repo: str) -> str:
+    """The activity / freshness cell for a repo row.
+
+    While ``repo`` is the active poll target AND a multi-pass review is emitting
+    agent events for one of *its* PRs, show live progress ("reviewing #N ·
+    done/total") so a minutes-long review reads as *working*, not as the
+    ambiguous "polling…" that's indistinguishable from a hang. The agents board
+    lags one PR behind ``active_repo`` (it resets only on the next PR's first
+    agent event), so the ``ap[0] == repo`` guard stops a freshly-active repo from
+    borrowing the previous repo's progress. Otherwise: bare "polling…" (active
+    but pre-lens), time-since-last-poll, or "—" if never polled.
+    """
+    if repo == state.active_repo:
+        ap = state.agents_pr
+        if ap is not None and ap[0] == repo and state.agents:
+            done = sum(1 for a in state.agents.values() if a["status"] == "done")
+            return f"reviewing #{ap[1]} · {done}/{len(state.agents)}"
+        return "polling…"
+    polled_at = state.repos[repo]["polled_at"]
+    if polled_at is not None:
+        return f"{_fmt_uptime((_utcnow() - polled_at).total_seconds())} ago"
+    return "—"
+
+
 def _monitoring(state: DashboardState) -> Panel:
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(style="bold", no_wrap=True)       # repo
     t.add_column(justify="right", no_wrap=True)     # open PR count
-    t.add_column(justify="right", no_wrap=True)     # poll freshness
+    t.add_column(justify="right", no_wrap=True)     # poll freshness / live progress
     t.add_column(ratio=1, overflow="ellipsis")      # last outcome
     for repo, st in state.repos.items():
         prs = "?" if st["open_prs"] is None else str(st["open_prs"])
-        if repo == state.active_repo:
-            age = "polling…"
-        elif st["polled_at"] is not None:
-            age = f"{_fmt_uptime((_utcnow() - st['polled_at']).total_seconds())} ago"
-        else:
-            age = "—"
         # Full-row reverse highlight marks the repo under active poll; cleared on
         # RepoDone so nothing is highlighted during the inter-cycle sleep.
         row_style = "reverse" if repo == state.active_repo else ""
-        t.add_row(repo, f"{prs} open", age, st["last"], style=row_style)
+        t.add_row(repo, f"{prs} open", _activity(state, repo), st["last"], style=row_style)
     return Panel(t, title="MONITORING", border_style="blue", title_align="left")
 
 

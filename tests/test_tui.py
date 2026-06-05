@@ -168,3 +168,68 @@ def test_build_layout_renders_active_repo_row(tmp_path):
     assert state.active_repo == "owner/repo"
     from rich.console import Console
     Console(width=120, height=40, file=open("/dev/null", "w")).print(build_layout(state))
+
+
+def _render(state, width=160) -> str:
+    import io
+
+    from rich.console import Console
+
+    buf = io.StringIO()
+    Console(width=width, file=buf, no_color=True).print(build_layout(state))
+    return buf.getvalue()
+
+
+def test_activity_shows_review_progress_for_active_pr(tmp_path):
+    # A repo under active review (agent events flowing for one of its PRs) must
+    # show live progress — not a bare "polling…" that's indistinguishable from a
+    # hang while a slow multi-pass review grinds for minutes.
+    from ghcr.tui import _activity
+
+    state, _ = _state(tmp_path)
+    state.apply(RepoListed(repo="owner/repo", open_prs=2))
+    state.apply(AgentEvent(repo="owner/repo", pr_number=50, agent="lens:correctness", status="done"))
+    state.apply(AgentEvent(repo="owner/repo", pr_number=50, agent="lens:security", status="running"))
+    assert _activity(state, "owner/repo") == "reviewing #50 · 1/2"
+
+
+def test_activity_active_without_agents_is_polling(tmp_path):
+    # Active but pre-lens (diff fetch / planner / skip-only repo): no agents yet.
+    from ghcr.tui import _activity
+
+    state, _ = _state(tmp_path)
+    state.apply(RepoListed(repo="owner/repo", open_prs=2))
+    assert _activity(state, "owner/repo") == "polling…"
+
+
+def test_activity_ignores_agents_from_a_different_repo(tmp_path):
+    # active_repo just advanced; agents_pr still holds the PREVIOUS repo's PR
+    # (it's reset only when the next PR's first agent event arrives). The new
+    # active repo must not borrow the prior repo's progress.
+    from ghcr.tui import _activity
+
+    state, _ = _state(tmp_path)
+    state.apply(AgentEvent(repo="owner/prev", pr_number=9, agent="lens:security", status="running"))
+    state.apply(RepoListed(repo="owner/repo", open_prs=1))
+    assert state.agents_pr == ("owner/prev", 9)
+    assert _activity(state, "owner/repo") == "polling…"
+
+
+def test_activity_idle_repo_shows_freshness_not_progress(tmp_path):
+    # A repo that finished its poll (RepoDone) is no longer active → it shows
+    # time-since-poll, never "reviewing".
+    from ghcr.tui import _activity
+
+    state, _ = _state(tmp_path)
+    state.apply(RepoListed(repo="owner/repo", open_prs=1))
+    state.apply(AgentEvent(repo="owner/repo", pr_number=50, agent="lens:security", status="done"))
+    state.apply(RepoDone(repo="owner/repo"))
+    assert "reviewing" not in _activity(state, "owner/repo")
+    assert _activity(state, "owner/repo").endswith("ago")
+
+
+def test_monitoring_renders_review_progress(tmp_path):
+    state, _ = _state(tmp_path)
+    state.apply(RepoListed(repo="owner/repo", open_prs=2))
+    state.apply(AgentEvent(repo="owner/repo", pr_number=50, agent="lens:correctness", status="running"))
+    assert "reviewing #50" in _render(state)
