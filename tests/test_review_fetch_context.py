@@ -145,6 +145,54 @@ def test_fetch_disabled_skips_planner_and_gh(tmp_path):
     assert all("REFERENCED DEFINITIONS" not in u for u in ds.user_for("## LENS: correctness"))
 
 
+def _orch_with_bus(tmp_path, gh, ds, **cfg_kw):
+    """Like ``_orch`` but wires a real EventBus and returns the recorded
+    AgentEvents so the planner's progress signal can be asserted."""
+    from ghcr.events import AgentEvent, EventBus
+
+    events: list = []
+    bus = EventBus()
+    bus.subscribe(lambda e: events.append(e) if isinstance(e, AgentEvent) else None)
+    cfg_kw.setdefault("fetch_referenced_context", True)
+    cfg = make_config(db_path=str(tmp_path / "ghcr.db"), review_mode="multi", **cfg_kw)
+    store = StateStore(cfg.db_path)
+    orch = ReviewOrchestrator(gh, ds, store, cfg, now=lambda: FIXED, bus=bus)
+    return orch, store, events
+
+
+def test_planner_emits_context_agent_running_then_done(tmp_path):
+    # The planner is the one slow pre-lens step; without an agent event the TUI
+    # row sits on bare "polling…" for its whole duration. It must announce itself.
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"db/base.py": BASE_SRC})
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, _store, events = _orch_with_bus(tmp_path, gh, ds)
+    orch.review_pr(make_pr())
+    ctx = [e for e in events if e.agent == "context"]
+    assert [e.status for e in ctx] == ["running", "done"]
+    assert all(e.pr_number == make_pr().number for e in ctx)
+
+
+def test_planner_failure_emits_failed_context_event(tmp_path):
+    def fail_planner(system, user):
+        raise DeepSeekError("planner down")
+
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"db/base.py": BASE_SRC})
+    ds = FakeDeepSeekClient(responses=_responses(planner=fail_planner))
+    orch, _store, events = _orch_with_bus(tmp_path, gh, ds)
+    out = orch.review_pr(make_pr())
+    assert out.action == "review"  # still degrades gracefully
+    ctx = [e for e in events if e.agent == "context"]
+    assert ctx and ctx[-1].status == "failed"
+
+
+def test_planner_disabled_emits_no_context_event(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"db/base.py": BASE_SRC})
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, _store, events = _orch_with_bus(tmp_path, gh, ds, fetch_referenced_context=False)
+    orch.review_pr(make_pr())
+    assert not [e for e in events if e.agent == "context"]
+
+
 def test_max_symbols_caps_resolution(tmp_path):
     planner = (
         '{"requests":['

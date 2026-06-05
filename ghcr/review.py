@@ -228,14 +228,20 @@ class ReviewOrchestrator:
         rc = self.cfg.review
         if not rc.fetch_referenced_context:
             return "", []
+        # Announce the planner as a sub-agent so the TUI shows "reviewing #N" from
+        # the moment it starts — this is the one slow pre-lens step, and without a
+        # signal the row sits on bare "polling…" for its whole (~minute) duration.
+        self._emit_agent(pr, "context", "running")
         try:
             res = self.deepseek.review(CONTEXT_REQUEST_PROMPT, build_context_request_user_prompt(pr, fd))
         except DeepSeekError as e:
             log.warning("context planner failed repo=%s pr=%s: %s", pr.repo, pr.number, e)
+            self._emit_agent(pr, "context", "failed", "planner api error")
             return "", []
         requests = parse_context_requests(res.content)[: rc.referenced_max_symbols]
         snippets = [s for s in (self._resolve_symbol(pr, req) for req in requests) if s]
         block = render_referenced_context(snippets, max_chars=rc.referenced_context_max_chars)
+        self._emit_agent(pr, "context", "done", f"{len(snippets)}/{len(requests)} symbols")
         return block, [res.usage]
 
     def _resolve_symbol(self, pr: PullRequest, req) -> ReferencedSnippet | None:
