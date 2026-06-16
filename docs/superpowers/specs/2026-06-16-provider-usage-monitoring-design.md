@@ -3,12 +3,17 @@
 **Date:** 2026-06-16
 **Status:** Design approved, pending spec review
 **Goal:** Make the live TUI provider-aware now that reviews can split across DeepSeek
-(worker: lenses) and Claude Opus (advisor: planner + scoring). Three additions:
+(worker: lenses) and Claude Opus (advisor: planner + scoring). Two additions:
 (1) label which model ran each sub-agent + show both models in the header;
-(2) track per-provider token usage from ghcr's own calls; (3) show approximate
-rolling 5h/7d Claude token windows parsed from `~/.claude` transcripts.
+(2) track **per-provider token usage**, persisted in SQLite so the TUI shows both
+session and 24h totals per provider and they survive a restart.
 
 Builds on the hybrid-advisor feature (`review.advisor_provider`, PR #7).
+
+> **Scope note:** an earlier draft included rolling 5h/7d Claude-token windows parsed
+> from `~/.claude` transcripts. **Dropped** — redundant with the official weighted %
+> the user already sees in the Claude Code statusline, and ghcr could only ever show
+> an inferior approximation. Not in this spec.
 
 ---
 
@@ -25,23 +30,22 @@ Builds on the hybrid-advisor feature (`review.advisor_provider`, PR #7).
   + advisor summed). The orchestrator already computes disjoint `worker_usages`
   (lenses) and `advisor_usages` (planner + scoring) buckets for the cost split, so
   the per-provider split is available at publish time but currently discarded.
-- Real Claude usage data: `~/.claude/projects/**/*.jsonl` transcripts (per-session
-  message logs; each assistant message has `message.usage` token counts + a
-  top-level `timestamp` + model). This is the live, current source (the
-  `stats-cache.json` `dailyModelTokens` is stale — months behind). The **official**
-  weighted 5h/7d % is only delivered live to the statusline via stdin and is NOT
-  file-readable by a separate daemon — so ghcr can only ever show an **approximate**
-  raw-token window, never Anthropic's exact %.
+- `state.py` `reviews` table stores merged `prompt_tokens` / `completion_tokens` /
+  `cost_usd` per row; `record(...)` inserts them; `usd_spent_since(cutoff)` sums
+  `cost_usd` for the 24h figure. Schema is created via `executescript(_SCHEMA)`
+  (`CREATE TABLE IF NOT EXISTS`) with a `schema_meta` `version='1'` row. **No
+  migration runner exists yet** — this spec adds a minimal one.
 
 ## 2. Feature 1 — label the advisor (Opus) in the TUI
 
 **Event change.** Add `model: str = ""` to `AgentEvent`. The orchestrator's
-`_emit_agent` gains the model of the client that ran the call:
+`_emit_agent` tags each event with the model of the client that ran the call:
 - planner (`context`) and scorer (`score:#N`) → `self.advisor.model`
-- lenses (`lens:*`) and single-mode → `self.deepseek.model`
+- lenses (`lens:*`) → `self.deepseek.model`
 
-(`ClaudeCliClient` and `DeepSeekClient` both expose `.model`; `DeepSeekClient`
-already has it, `ClaudeCliClient` already has it.)
+Both `ClaudeCliClient` and `DeepSeekClient` already expose `.model`. `_emit_agent`
+is the single choke point; thread the model in there (the caller already knows
+whether it is a lens, planner, or scorer). The bus stays thread-safe (pure data).
 
 **TUI change.**
 - Agent board rows append the model when present: `score:#3 · opus  ✓`.
@@ -49,162 +53,129 @@ already has it, `ClaudeCliClient` already has it.)
   `worker: deepseek-v4-pro · advisor: opus`. When `advisor_provider == "deepseek"`
   (advisor IS worker), show just the one model as today (no visual change off-path).
 
-`_emit_agent` is the single choke point, so threading off the model is a one-line
-change per call site (or pass it once where the agent string is built). No new
-publish sites; the bus stays thread-safe (still pure data).
+## 3. Feature 2 — per-provider token tracking, persisted
 
-## 3. Feature 2 — per-provider token tracking (ghcr's own calls)
+### 3.1 Event change
 
-**Event change.** Redefine the existing `DeepSeekDone` token fields by provider and
-add the advisor pair (no rename — keep the name to limit churn; it is the
-"review done" event):
+Redefine the existing `DeepSeekDone` token fields by provider and add the advisor
+pair (keep the event name to limit churn — it is the "review done" event):
 - `prompt_tokens` / `completion_tokens` → the **worker** (DeepSeek) portion.
 - New `advisor_prompt_tokens: int = 0` / `advisor_completion_tokens: int = 0` →
   the **advisor** (Claude) portion.
 
 Default path (`advisor_provider == "deepseek"`): advisor bucket is empty, advisor_*
-= 0, and `prompt_tokens`/`completion_tokens` equal the full review as before →
+= 0, and `prompt_tokens` / `completion_tokens` equal the full review as before →
 **no behavior change off-path.** The orchestrator publishes from its existing
-`worker_usages` / `advisor_usages` buckets: `merge_usages(worker_usages)` →
-worker fields, `merge_usages(advisor_usages)` → advisor fields.
+buckets: `merge_usages(worker_usages)` → worker fields, `merge_usages(advisor_usages)`
+→ advisor fields.
 
-**TUI change.** `DashboardState` gains session counters: `worker_prompt`,
-`worker_completion`, `advisor_prompt`, `advisor_completion` (ints, summed on each
-`DeepSeekDone`). The header/cost region shows a per-provider line:
-`deepseek 12.3k↑/4.1k↓ · opus 2.0k↑/0.9k↓` (advisor segment hidden when zero).
-The existing per-review event-log line keeps working (now worker-only tokens,
-which is the correct DeepSeek figure).
+### 3.2 Persistence (schema + migration)
 
-**No DB schema change.** Per-provider totals are session-scoped (accumulated from
-the live event stream since TUI start). 24h/historical per-provider persistence is
-out of scope (YAGNI) — `cost` history already lives in the DB and the cost split is
-already correct there.
-
-## 4. Feature 3 — approximate rolling 5h/7d Claude windows
-
-### 4.1 New pure module `ghcr/usage_window.py`
-
-```python
-@dataclass(frozen=True)
-class ModelTokens:
-    total: int = 0                       # input + output + cache tokens
-    by_model: tuple[tuple[str, int], ...] = ()  # [(model, tokens)], desc
-
-@dataclass(frozen=True)
-class WindowUsage:
-    five_h: ModelTokens
-    seven_d: ModelTokens
-    five_h_decay_at: float | None = None  # earliest in-window ts + 5h (epoch); the
-                                          # natural "reset" analog for a rolling sum
-    seven_d_decay_at: float | None = None
-    ok: bool = True                       # False = scan failed → TUI shows "n/a"
-
-def scan_claude_usage(claude_dir: str, now: float,
-                      five_h_secs: int = 5*3600,
-                      seven_d_secs: int = 7*86400) -> WindowUsage:
-    """Sum Claude token usage in the rolling 5h and 7d windows from CC transcripts.
-    Best-effort: missing dir / unreadable files / malformed lines are skipped;
-    any unexpected error returns WindowUsage(ok=False). Never raises."""
+**New columns on `reviews`:**
+```sql
+advisor_prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+advisor_completion_tokens INTEGER NOT NULL DEFAULT 0
 ```
+- Add them to `_SCHEMA` (so fresh DBs get them) AND in a migration for existing DBs.
+- The existing `prompt_tokens` / `completion_tokens` columns now hold the **worker**
+  portion. Pre-existing rows keep their merged value there — which equals worker for
+  every historical row (all prior reviews were DeepSeek-only), so no backfill needed.
 
-**Algorithm.**
-1. Glob `{claude_dir}/projects/**/*.jsonl`. **Filter to files with mtime within
-   the 7d window** — a file last written ≥7d ago cannot hold an in-window message.
-   This bounds work to a handful of active-session files, not all ~900.
-2. For each kept file, read line by line. Parse each line as JSON (skip on error).
-   Keep lines that look like an assistant message with usage: a top-level
-   `timestamp` (ISO-8601) and a `message.usage` object with integer token fields.
-3. Token total per message = `input_tokens + output_tokens +
-   cache_creation_input_tokens + cache_read_input_tokens` (missing → 0). Model =
-   `message.model` (fallback `"unknown"`).
-4. Bucket by age: `now - ts <= 7d` → seven_d; `<= 5h` → five_h (a 5h message is
-   also in 7d). Accumulate totals + per-model sums; track the earliest in-window
-   timestamp per window for the decay hint.
-5. Return `WindowUsage`. Per-model lists sorted desc, capped to top N (e.g. 4).
+**Minimal migration runner.** In `StateStore.__init__`, after `executescript(_SCHEMA)`:
+- Read `PRAGMA table_info(reviews)`; if `advisor_prompt_tokens` is absent, run
+  `ALTER TABLE reviews ADD COLUMN advisor_prompt_tokens INTEGER NOT NULL DEFAULT 0`
+  and the matching `advisor_completion_tokens`. Idempotent (guarded by the column
+  check), so it is safe to run every startup. Bump `schema_meta` version to `'2'`.
+- `ALTER TABLE ADD COLUMN` with a constant default is O(1) in SQLite (no table
+  rewrite), so this is cheap even on large DBs.
 
-Pure and dependency-free (stdlib `json`, `glob`, `os`, `datetime`). Unit-tested
-against fixture `.jsonl` files with synthetic timestamps + a fixed `now`.
+### 3.3 `record()` change
 
-### 4.2 Periodic scan in the TUI
+`record(...)` gains `advisor_usage: Usage | None = None`. The `usage` param now
+carries the **worker** portion; `advisor_usage` the advisor portion. The INSERT adds
+the two new columns (defaulting to 0 when `advisor_usage` is None).
 
-The TUI render loop already ticks on a timer. Add a throttled refresh: at most once
-per `refresh_seconds` (default 60), run `scan_claude_usage` **off the render thread**
-(a short-lived worker / the existing daemon worker) and store the result in
-`DashboardState.window_usage`. The scan reading the filesystem must never block a
-render frame; a stale-but-present `WindowUsage` is shown between refreshes.
+**Orchestrator call sites:**
+- Multi success + all-lenses-failed: pass `usage=merge_usages(worker_usages)`,
+  `advisor_usage=merge_usages(advisor_usages)` (both lists already exist).
+- Single mode / skips / post-failure: unchanged call shape — `usage` is the worker
+  (or zero) and `advisor_usage` defaults None → 0. (Single mode is DeepSeek-only, so
+  its one call is worker.)
 
-### 4.3 TUI panel
+### 3.4 24h query
 
-A compact line/panel labeled to signal it is approximate and account-wide:
-```
-Claude (approx, all CC use)  5h 1.2M tok (decays @14:30)  ·  7d 14.8M tok
-```
-- Tokens human-formatted (k/M). Decay hint from `*_decay_at` (`@HH:MM` for 5h,
-  `@Day HH:MM` for 7d); omitted if `None`.
-- `ok=False` or absent → render `Claude usage: n/a`.
-- No color thresholds / % (no real denominator) — raw totals only, per the chosen
-  display option. (The optional per-model breakdown can render in `detail`/tooltip
-  space if it fits; otherwise show only the totals.)
+New `StateStore.tokens_spent_since(cutoff: datetime) -> ProviderTokens` returning a
+small frozen struct (or 4-tuple) of summed `prompt_tokens`, `completion_tokens`,
+`advisor_prompt_tokens`, `advisor_completion_tokens` over rows with
+`created_at >= cutoff`. Mirrors `usd_spent_since`.
 
-## 5. Config
+### 3.5 TUI display
 
-New optional `monitor:` block (all defaulted; absent block = sensible defaults):
-```yaml
-monitor:
-  claude_dir: ~/.claude          # transcript root for the 5h/7d scan
-  window_refresh_seconds: 60     # how often to rescan
-```
-- `MonitorConfig(claude_dir: str, window_refresh_seconds: int)` frozen dataclass;
-  `Config.monitor: MonitorConfig` with defaults so existing configs/`make_config`
-  keep working.
-- Restart-only (the TUI binds the scanner at startup). Document alongside the other
-  restart-only fields.
-- `claude_dir` is `~`-expanded in `load_config`.
+- `DashboardState` gains session counters (`worker_prompt`, `worker_completion`,
+  `advisor_prompt`, `advisor_completion`), incremented on each `DeepSeekDone`.
+- At startup, **seed the 24h per-provider totals from the DB** via
+  `tokens_spent_since(now - 24h)` (the TUI is constructed with the store handle, the
+  same way the 24h cost is available), then keep them live during the session.
+- Header / cost region shows a per-provider line, e.g.:
+  `tokens 24h — deepseek 1.2M↑/410k↓ · opus 180k↑/95k↓` (advisor segment hidden
+  when its totals are zero, so the off-path display is unchanged).
+- The existing per-review event-log line keeps working — now showing worker-only
+  tokens, which is the correct DeepSeek figure for that line.
 
-## 6. Error handling / invariants
+## 4. Config
 
-- **Window scan is best-effort** (mirrors the comment-fetch invariant): missing
-  dir, unreadable file, malformed JSON, schema drift → skip / `ok=False`. It must
-  never raise into the TUI loop or affect reviews. It is **display-only** — it reads
-  no review state and feeds nothing back into the pipeline.
-- **Thread safety** unchanged: `AgentEvent`/`DeepSeekDone` stay pure data published
-  as today; the window scan runs off the render thread and only writes
-  `DashboardState` (TUI-owned). No pool worker touches new shared state.
-- **Frozen dataclasses**; `WindowUsage`/`ModelTokens`/`MonitorConfig` are frozen.
-- **Off-path no-op:** with `advisor_provider == "deepseek"`, Features 1–2 render
-  exactly as today (advisor model == worker, advisor tokens == 0). Feature 3 is
-  independent of provider config (always shows account-wide Claude usage if a
-  `~/.claude` exists).
-- **Schema coupling** (Feature 3) is the known risk: the transcript `.jsonl` shape
-  is Claude Code's internal format and may drift. Mitigation: parse defensively,
-  degrade to `n/a`, and keep the parser isolated in one pure module so a fix is
-  localized + unit-test-pinned.
+**No new config.** Both features are driven by existing state (`advisor_provider`
+selects whether the advisor differs; the models come from the constructed clients).
 
-## 7. Testing
+## 5. Error handling / invariants
 
-- `tests/test_usage_window.py` (pure): fixture `.jsonl` with messages at known
-  offsets from a fixed `now` → assert 5h vs 7d bucketing, per-model sums, cache
-  token inclusion, decay timestamps; malformed lines skipped; missing dir →
-  `ok=False`; a file with old mtime excluded.
-- Orchestrator test: `DeepSeekDone` carries worker tokens in `prompt_tokens`/
-  `completion_tokens` and Claude tokens in `advisor_*` when `advisor_provider=claude`;
-  default path puts everything in the worker fields with `advisor_*` == 0.
-- `AgentEvent.model` populated (advisor model for planner/scorer, worker for lenses).
-- Config: `monitor` defaults applied when block absent; `claude_dir` `~`-expanded.
-- TUI rendering: light — a state→panel-string test for the per-provider line and the
-  window line (incl. the `n/a` path). No live terminal.
+- **Migration is safe + idempotent:** column-existence-guarded `ALTER`, constant
+  default, runs every startup without harm. A fresh DB gets the columns from
+  `_SCHEMA`; an old DB gets them from the migration; no backfill needed.
+- **Post-then-record ordering unchanged.** Only the columns written by `record`
+  change; the call still happens after a successful post on the success path.
+- **Off-path no-op:** with `advisor_provider == "deepseek"`, advisor model == worker
+  and advisor tokens == 0, so the header collapses to one model and the advisor
+  token segment is hidden — identical to today.
+- **Thread safety unchanged:** `AgentEvent` / `DeepSeekDone` stay pure data published
+  on the main thread (the aggregated `DeepSeekDone` is already published once on the
+  main thread, not from pool workers). No pool worker touches the store or new state.
+- **Frozen dataclasses:** the new `ProviderTokens` struct (if used) is frozen;
+  events stay frozen.
+- **Terminal vs transient outcomes unchanged:** the migration adds columns only; the
+  unique index and `SEEN_OUTCOMES` logic are untouched.
 
-## 8. Out of scope (YAGNI)
+## 6. Testing
 
-- Anthropic's official weighted 5h/7d % (not file-accessible; user already has it in
-  the statusline).
-- Per-provider token **history**/24h persistence in SQLite (session totals suffice).
+- `tests/test_state.py`:
+  - `record(usage=worker, advisor_usage=advisor)` persists all four token columns;
+    `tokens_spent_since` sums them across rows within the cutoff and excludes older
+    rows.
+  - Migration: open a DB created without the advisor columns (simulate by creating
+    the old schema, or by deleting the columns), re-open via `StateStore`, assert the
+    columns now exist and existing rows are readable (worker tokens intact,
+    advisor tokens default 0).
+  - Default call (`advisor_usage=None`) → advisor columns 0.
+- Orchestrator test (`tests/test_review_hybrid.py` extension): with
+  `advisor_provider=claude`, the published `DeepSeekDone` carries worker tokens in
+  `prompt_tokens` / `completion_tokens` and Claude tokens in `advisor_*`; and the
+  recorded row has the split persisted. Default path → everything in worker fields,
+  `advisor_*` == 0.
+- `AgentEvent.model` populated correctly (advisor model for planner/scorer, worker
+  for lenses) — assert via the event capture already used in TUI/agent tests.
+- TUI rendering: light state→panel-string test for the per-provider line, including
+  the advisor-hidden (off-path) case and the both-providers case.
+
+## 7. Out of scope (YAGNI)
+
+- Rolling 5h/7d Claude-token windows / `~/.claude` transcript parsing (dropped —
+  redundant with the statusline's official %).
+- Anthropic's official weighted % (not file-accessible; user has it in the statusline).
 - Enforcement / self-throttle (pausing Claude calls at a cap) — not requested.
-- Shelling out to `ccusage` (in-house parser chosen).
-- Configurable caps / colored % bars for the windows (raw totals chosen).
+- Per-finding or per-lens token attribution — only worker-vs-advisor is tracked.
 
-## 9. Open items
+## 8. Open items
 
-None blocking. Defaults locked: in-house parser, raw totals + decay hint, no caps,
-`monitor` restart-only, `DeepSeekDone` kept (not renamed), per-provider tokens
-session-scoped (no DB migration).
+None blocking. Defaults locked: `DeepSeekDone` kept (not renamed); worker tokens in
+the existing columns + two new advisor columns; idempotent `ALTER`-based migration
+bumping schema version to 2; per-provider 24h via `tokens_spent_since`; no new config.
