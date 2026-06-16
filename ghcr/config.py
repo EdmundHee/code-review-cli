@@ -76,6 +76,14 @@ class DeepSeekConfig:
 
 
 @dataclass(frozen=True)
+class ClaudeConfig:
+    claude_path: str
+    model: str
+    request_timeout_seconds: int
+    prices: Prices  # default 0/0 → subscription is flat, report $0
+
+
+@dataclass(frozen=True)
 class ReviewPolicy:
     skip_drafts: bool
     review_backlog_on_start: bool
@@ -105,6 +113,7 @@ class ReviewModeConfig:
     referenced_max_symbols: int = 6  # cap on symbols resolved per review
     referenced_context_max_chars: int = 6000  # budget for the rendered referenced-defs block
     referenced_search_limit: int = 5  # code-search results scanned per unresolved symbol
+    advisor_provider: str = "deepseek"  # "deepseek" | "claude" (planner+scoring on Opus)
 
 
 @dataclass(frozen=True)
@@ -125,14 +134,18 @@ class Config:
     review: ReviewModeConfig
     db_path: str
     log_level: str
+    claude: "ClaudeConfig | None" = None
 
 
 # Fields safe to swap into a running loop (read fresh every cycle/PR). The rest
 # bind something at startup that a live swap won't touch: github/deepseek/db_path
 # construct a client or store, and log_level is applied once via logging.basicConfig
 # (nothing re-runs setLevel on reload), so all of them need a restart to take effect.
+# NOTE: review.advisor_provider is hot-reloadable as a value, but the advisor
+# CLIENT is constructed at startup (cli._build) — flipping deepseek<->claude
+# requires a restart to take effect.
 _RELOADABLE = ("repos", "poll_interval_seconds", "review_policy", "diff", "budgets", "review")
-_RESTART_ONLY = ("github", "deepseek", "db_path", "log_level")
+_RESTART_ONLY = ("github", "deepseek", "db_path", "log_level", "claude")
 
 
 def merge_reloadable(old: Config, new: Config) -> tuple[Config, list[str]]:
@@ -182,6 +195,12 @@ def _parse_review(review: dict) -> "ReviewModeConfig":
     if max_parallel < 0:
         raise ConfigError("review.max_parallel must be >= 0 (0 = unbounded)")
 
+    advisor_provider = review.get("advisor_provider", "deepseek")
+    if advisor_provider not in ("deepseek", "claude"):
+        raise ConfigError(
+            f"review.advisor_provider must be 'deepseek' or 'claude', got {advisor_provider!r}"
+        )
+
     return ReviewModeConfig(
         mode=mode,
         lenses=tuple(lenses),
@@ -195,6 +214,7 @@ def _parse_review(review: dict) -> "ReviewModeConfig":
         referenced_max_symbols=max(0, int(review.get("referenced_max_symbols", 6))),
         referenced_context_max_chars=max(0, int(review.get("referenced_context_max_chars", 6000))),
         referenced_search_limit=max(1, int(review.get("referenced_search_limit", 5))),
+        advisor_provider=advisor_provider,
     )
 
 
@@ -218,6 +238,8 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
     poll = raw.get("poll", {}) or {}
     storage = raw.get("storage", {}) or {}
     logging_cfg = raw.get("logging", {}) or {}
+
+    claude_raw = raw.get("claude", {}) or {}
 
     repos = raw.get("repos") or []
     if not repos:
@@ -286,6 +308,19 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
 
     review_cfg = _parse_review(review)
 
+    claude_cfg = None
+    if review_cfg.advisor_provider == "claude":
+        cprices_raw = claude_raw.get("prices", {}) or {}
+        claude_cfg = ClaudeConfig(
+            claude_path=claude_raw.get("claude_path", "claude"),
+            model=claude_raw.get("model", "opus"),
+            request_timeout_seconds=int(claude_raw.get("request_timeout_seconds", 600)),
+            prices=Prices(
+                input_per_1m=float(cprices_raw.get("input_per_1m", 0.0)),
+                output_per_1m=float(cprices_raw.get("output_per_1m", 0.0)),
+            ),
+        )
+
     return Config(
         github=github_cfg,
         deepseek=deepseek_cfg,
@@ -297,4 +332,5 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
         review=review_cfg,
         db_path=os.path.expanduser(storage.get("db_path", "~/.local/state/ghcr/ghcr.db")),
         log_level=str(logging_cfg.get("level", "INFO")).upper(),
+        claude=claude_cfg,
     )

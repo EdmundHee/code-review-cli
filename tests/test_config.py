@@ -1,4 +1,5 @@
 import dataclasses
+import textwrap
 
 import pytest
 
@@ -197,3 +198,53 @@ def test_merge_preserves_restart_only_fields(tmp_path):
     assert merged.db_path == str(tmp_path / "db")
     # and reported
     assert set(restart) == {"github", "deepseek", "db_path"}
+
+
+# -- advisor_provider / ClaudeConfig -----------------------------------------
+
+_ADVISOR_BASE = textwrap.dedent("""
+    github: {bot_login: bot, token_env: GH_TOKEN}
+    deepseek: {api_key_env: DS_KEY}
+    repos: [owner/repo]
+""")
+
+
+def test_advisor_provider_defaults_to_deepseek(tmp_path):
+    cfg = load_config(_write(tmp_path, _ADVISOR_BASE), env={"GH_TOKEN": "x", "DS_KEY": "y"})
+    assert cfg.review.advisor_provider == "deepseek"
+    assert cfg.claude is None
+
+
+def test_advisor_provider_claude_builds_claude_config(tmp_path):
+    body = _ADVISOR_BASE + textwrap.dedent("""
+    review: {advisor_provider: claude}
+    claude: {model: opus, claude_path: /usr/local/bin/claude}
+    """)
+    cfg = load_config(_write(tmp_path, body), env={"GH_TOKEN": "x", "DS_KEY": "y"})
+    assert cfg.review.advisor_provider == "claude"
+    assert cfg.claude.model == "opus"
+    assert cfg.claude.claude_path == "/usr/local/bin/claude"
+    assert cfg.claude.prices.input_per_1m == 0.0
+    assert cfg.claude.prices.output_per_1m == 0.0
+
+
+def test_advisor_provider_invalid_raises(tmp_path):
+    body = _ADVISOR_BASE + "\nreview: {advisor_provider: gemini}\n"
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, body), env={"GH_TOKEN": "x", "DS_KEY": "y"})
+
+
+def test_merge_reports_claude_change_as_restart_only(tmp_path):
+    from ghcr.config import ClaudeConfig
+    from ghcr.cost import Prices
+
+    old = make_config(db_path=str(tmp_path / "db"))
+    claude_cfg = ClaudeConfig(
+        claude_path="claude", model="opus", request_timeout_seconds=600,
+        prices=Prices(input_per_1m=0.0, output_per_1m=0.0),
+    )
+    new = dataclasses.replace(old, claude=claude_cfg)
+    merged, restart = merge_reloadable(old, new)
+    # claude is restart-only: change is dropped from merged but reported
+    assert merged.claude is None
+    assert "claude" in restart
