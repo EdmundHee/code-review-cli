@@ -3,10 +3,13 @@
 Splits the terminal into four panels — monitoring, latest DeepSeek response,
 cost per PR, and a job-event log — fed by the in-process ``EventBus``.
 
-Threading model: the poll loop runs in a daemon worker thread and owns the
-``StateStore`` (sqlite connections are thread-bound). The main thread only
-renders. The dashboard therefore never touches the DB after the worker starts;
-it seeds once up front and tracks 24h spend live from ``PrOutcome`` events.
+Threading model: the poll loop runs in a daemon worker thread and owns its
+``StateStore`` (sqlite connections are thread-bound). The main render thread
+keeps its OWN read-only ``StateStore`` and re-queries rolling-24h + calendar-day
+spend/tokens from it once per second — so the header ages out spend exactly like
+the live budget gate (``review.usd_spent_since``), never drifting. The two
+connections are never shared across threads. Per-PR events still drive the
+cost/agent/history panels live.
 """
 
 from __future__ import annotations
@@ -52,6 +55,34 @@ def _blank_repo() -> dict:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _local_midnight(now: datetime) -> datetime:
+    """The most recent local-midnight at/before ``now``, returned as tz-aware UTC.
+
+    UTC so its ``isoformat()`` carries ``+00:00`` and compares lexicographically
+    against the stored ``created_at`` (also UTC) in ``usd_spent_since``.
+    """
+    local_midnight = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    return local_midnight.astimezone(timezone.utc)
+
+
+def refresh_from_db(state: "DashboardState", store: StateStore, now: datetime) -> None:
+    """Re-read rolling-24h + calendar-day spend/tokens from the DB (main thread only).
+
+    The DB is the single source of truth: aged-out spend drops off automatically and
+    the header tracks the live budget gate. Best-effort — a read error leaves the
+    previous values untouched rather than crashing the render loop.
+    """
+    try:
+        day_cutoff = now - timedelta(hours=24)
+        state.spent_24h = store.usd_spent_since(day_cutoff)
+        state.spent_today = store.usd_spent_since(_local_midnight(now))
+        tok = store.tokens_spent_since(day_cutoff)
+        state.tok24_wp, state.tok24_wc = tok.worker_prompt, tok.worker_completion
+        state.tok24_ap, state.tok24_ac = tok.advisor_prompt, tok.advisor_completion
+    except Exception:  # never let a DB hiccup take down the dashboard
+        pass
 
 
 def _hhmmss(iso_or_dt) -> str:
@@ -103,7 +134,8 @@ class DashboardState:
         self.cost_rows: deque = deque(maxlen=50)
         self.events: deque = deque(maxlen=200)
         self.spent_24h = 0.0
-        # Per-provider token tracking. 24h (seeded from DB, kept live) + session (since
+        self.spent_today = 0.0  # calendar-day spend (since local midnight); resets at 00:00
+        # Per-provider token tracking. 24h (re-queried from DB each tick) + session (since
         # TUI start). wp/wc = worker (DeepSeek), ap/ac = advisor (Claude).
         self.tok24_wp = self.tok24_wc = self.tok24_ap = self.tok24_ac = 0
         self.sess_wp = self.sess_wc = self.sess_ap = self.sess_ac = 0
@@ -173,10 +205,8 @@ def reduce(state: DashboardState, evt: object) -> None:
             state.events.append(f"{_hhmmss(_utcnow())} {evt.repo}#{evt.pr_number} {evt.agent} failed: {evt.detail}")
     elif isinstance(evt, DeepSeekDone):
         state.latest = evt
-        state.tok24_wp += evt.prompt_tokens
-        state.tok24_wc += evt.completion_tokens
-        state.tok24_ap += evt.advisor_prompt_tokens
-        state.tok24_ac += evt.advisor_completion_tokens
+        # 24h token totals come from the DB re-query (refresh_from_db), not here —
+        # so they age out. Session totals stay live (they never roll off).
         state.sess_wp += evt.prompt_tokens
         state.sess_wc += evt.completion_tokens
         state.sess_ap += evt.advisor_prompt_tokens
@@ -202,7 +232,8 @@ def reduce(state: DashboardState, evt: object) -> None:
             state.cost_rows.append(
                 {"pr": evt.pr_number, "repo": evt.repo, "cost": evt.cost_usd, "outcome": evt.action}
             )
-            state.spent_24h += evt.cost_usd
+            # spent_24h is owned by refresh_from_db (DB = single source of truth) so it
+            # ages out; the cost row above drives the COST PER PR panel instantly.
         state.events.append(f"{_hhmmss(_utcnow())} {evt.repo} {detail} {mark}")
     elif isinstance(evt, LogLine):
         state.events.append(f"{evt.ts} {evt.name}: {evt.message}")
@@ -233,6 +264,7 @@ def _header(state: DashboardState) -> Panel:
         (models, "magenta"), " · ",
         f"up {up}", " · ",
         ("24h ", "dim"), (f"${spent:.3f}/${state.budget:.2f}", color), " · ",
+        ("today ", "dim"), (f"${state.spent_today:.3f}", "green"), " · ",
         ("tok ", "dim"), (tok, "cyan"),
     )
     return Panel(text, border_style="cyan")
@@ -407,11 +439,11 @@ def run_tui(cfg: Config, config_path: str | None = None) -> int:
     gh = GhClient(cfg.github.gh_path, cfg.github.token, cfg.github.request_timeout_seconds)
     preflight(gh, cfg)
 
-    # Seed once from the DB in the main thread, then never touch it here again.
+    # Seed for first paint, then keep this main-thread connection open so the render
+    # loop can re-query rolling-24h + calendar-day totals (its own sqlite handle).
     seed_store = StateStore(cfg.db_path)
     cutoff = _utcnow() - timedelta(hours=24)
     state.seed(seed_store.recent(20), seed_store.usd_spent_since(cutoff), seed_store.tokens_spent_since(cutoff))
-    seed_store.close()
 
     _reconfigure_logging(cfg, bus)
 
@@ -431,12 +463,17 @@ def run_tui(cfg: Config, config_path: str | None = None) -> int:
 
     try:
         with Live(build_layout(state), screen=True, refresh_per_second=4) as live:
+            last_refresh = 0.0
             while worker.is_alive():
+                if time.monotonic() - last_refresh >= 1.0:  # rolling re-query, ~1/sec
+                    refresh_from_db(state, seed_store, _utcnow())
+                    last_refresh = time.monotonic()
                 live.update(build_layout(state))
                 time.sleep(0.25)
     except KeyboardInterrupt:
         pass
     finally:
+        seed_store.close()
         loop = holder.get("loop")
         if loop is not None:
             loop.request_stop()

@@ -61,11 +61,12 @@ def test_deepseek_done_becomes_latest(tmp_path):
     assert any("deepseek" in e for e in state.events)
 
 
-def test_pr_outcome_review_adds_cost_row_and_spend(tmp_path):
+def test_pr_outcome_review_adds_cost_row(tmp_path):
+    # spent_24h is no longer bumped by the event — it's owned by refresh_from_db
+    # (DB = single source of truth, so it ages out). The cost row still lands live.
     state, _ = _state(tmp_path)
     state.apply(PrOutcome(repo="owner/repo", pr_number=42, action="review",
                           cost_usd=0.018, head_sha="a1b2c3d4e5f6"))
-    assert state.spent_24h == 0.018
     assert state.cost_rows[-1]["pr"] == 42
     # last column shows the action AND the short commit SHA that was reviewed.
     assert state.repos["owner/repo"]["last"] == "#42 review a1b2c3d $0.0180"
@@ -86,7 +87,6 @@ def test_skip_seen_does_not_clobber_recorded_review(tmp_path):
     state.apply(PrOutcome(repo="owner/repo", pr_number=2, action="skip_seen", cost_usd=0.0))
     # The review line and cost survive; skip_seen adds no event noise.
     assert state.repos["owner/repo"]["last"].startswith("#2 review")
-    assert state.spent_24h == 0.018
     assert len(state.cost_rows) == 1
     assert len(state.events) == before
 
@@ -251,15 +251,16 @@ def test_seed_sets_24h_provider_tokens():
     assert st.tok24_ap == 10 and st.tok24_ac == 5
 
 
-def test_deepseekdone_accumulates_provider_tokens():
+def test_deepseekdone_accumulates_session_tokens_only():
+    # Session totals stay live (never roll off); 24h totals are owned by the DB
+    # re-query (refresh_from_db) so the event must NOT bump them.
     st = _pstate()
     st.seed([], spent_24h=0.0, tokens_24h=ProviderTokens(0, 0, 0, 0))
     st.apply(DeepSeekDone(repo="o/r", pr_number=1, prompt_tokens=50, completion_tokens=20,
                           latency_s=1.0, snippet="x", advisor_prompt_tokens=8, advisor_completion_tokens=3))
-    assert st.tok24_wp == 50 and st.tok24_wc == 20
-    assert st.tok24_ap == 8 and st.tok24_ac == 3
     assert st.sess_wp == 50 and st.sess_ap == 8
     assert st.sess_wc == 20 and st.sess_ac == 3
+    assert st.tok24_wp == 0 and st.tok24_ap == 0  # untouched by the event
 
 
 def test_advisor_model_off_path_equals_worker():
@@ -282,3 +283,66 @@ def test_header_shows_both_models_and_opus_tokens_when_hybrid():
     text = panel.renderable.plain if hasattr(panel.renderable, "plain") else str(panel.renderable)
     assert "opus" in text and st.model in text   # both models shown
     assert "ds " in text                          # per-provider token line present
+
+
+# -- rolling-24h re-query + calendar-day ("today") tests ----------------------
+
+from datetime import datetime, timedelta, timezone
+
+from ghcr.models import Usage
+from ghcr.state import StateStore
+from ghcr.tui import _local_midnight, refresh_from_db
+
+
+def test_local_midnight_is_utc_within_24h_and_lands_on_midnight():
+    now = datetime(2026, 6, 16, 12, 0, 0, tzinfo=timezone.utc)
+    m = _local_midnight(now)
+    assert m.tzinfo == timezone.utc
+    assert m <= now and now - m < timedelta(hours=24)
+    local = m.astimezone()  # back to system local tz
+    assert (local.hour, local.minute, local.second) == (0, 0, 0)
+
+
+def test_refresh_rolls_off_old_spend_and_tracks_today(tmp_path):
+    st = _pstate()
+    store = StateStore(str(tmp_path / "roll.db"))
+    now = datetime(2026, 6, 16, 12, 0, 0, tzinfo=timezone.utc)
+    midnight = _local_midnight(now)
+    # at `now`: counts in BOTH the 24h window and today (regardless of local tz).
+    store.record("o/r", 1, "sha1", "reviewed", cost_usd=0.02,
+                 usage=Usage(prompt_tokens=100, completion_tokens=40),
+                 advisor_usage=Usage(prompt_tokens=10, completion_tokens=5),
+                 created_at=now.isoformat())
+    # 1s before local midnight: still in the 24h window, NOT today.
+    store.record("o/r", 2, "sha2", "reviewed", cost_usd=0.03,
+                 created_at=(midnight - timedelta(seconds=1)).isoformat())
+    # 25h ago: outside both windows — must roll off.
+    store.record("o/r", 3, "sha3", "reviewed", cost_usd=0.99,
+                 usage=Usage(prompt_tokens=999, completion_tokens=999),
+                 created_at=(now - timedelta(hours=25)).isoformat())
+
+    refresh_from_db(st, store, now)
+    store.close()
+
+    assert round(st.spent_24h, 4) == 0.05     # 0.02 + 0.03; 0.99 aged out
+    assert round(st.spent_today, 4) == 0.02   # only the post-midnight row
+    assert st.tok24_wp == 100 and st.tok24_wc == 40   # 999 excluded
+    assert st.tok24_ap == 10 and st.tok24_ac == 5
+
+
+def test_refresh_is_best_effort_on_db_error(tmp_path):
+    st = _pstate()
+    st.spent_24h, st.spent_today = 1.5, 0.7
+    store = StateStore(str(tmp_path / "roll.db"))
+    store.close()  # closed connection → queries raise; refresh must swallow it
+    refresh_from_db(st, store, datetime(2026, 6, 16, 12, 0, 0, tzinfo=timezone.utc))
+    assert st.spent_24h == 1.5 and st.spent_today == 0.7  # left untouched
+
+
+def test_header_shows_today_spend():
+    from ghcr.tui import _header
+    st = _pstate()
+    st.spent_24h, st.spent_today = 1.2, 0.8
+    panel = _header(st)
+    text = panel.renderable.plain if hasattr(panel.renderable, "plain") else str(panel.renderable)
+    assert "today $0.800" in text and "24h $1.200" in text

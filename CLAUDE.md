@@ -81,10 +81,16 @@ the worker total and advisor tokens are 0 — so a DeepSeek-only review shows no
 `DeepSeekDone` carries both (`prompt_tokens`/`completion_tokens` = worker; `advisor_*` = advisor),
 `AgentEvent.model` tags which model ran each sub-agent (`score:#3 · opus`), and the split is
 **persisted** on the `reviews` row (`advisor_prompt_tokens`/`advisor_completion_tokens`; schema v2 via
-an idempotent, column-guarded `ALTER` migration in `StateStore._migrate`). The TUI seeds 24h
-per-provider totals from `tokens_spent_since` (→ `ProviderTokens`) and shows both models +
-`tok ds …↑/…↓ · opus …↑/…↓`. Off-path the advisor columns/fields are 0 and the display collapses to a
-single model — unchanged.
+an idempotent, column-guarded `ALTER` migration in `StateStore._migrate`). The TUI seeds for first
+paint, then the **main render thread re-queries the DB once/sec** (`tui.refresh_from_db` — its own
+main-thread `StateStore`, never shared with the worker): rolling-24h spend + per-provider tokens
+(`usd_spent_since`/`tokens_spent_since`, → `ProviderTokens`) so the header **ages out exactly like the
+budget gate** (no monotonic drift), plus a **calendar-day `today $X`** figure (`usd_spent_since`
+from `_local_midnight`, resets at 00:00 local). The DB is the single source of truth — `reduce()` no
+longer bumps `spent_24h`/`tok24_*` on events (so no cross-thread write race); only the cost/agent/
+history panels and `sess_*` session totals stay event-driven. Header shows both models +
+`24h $…/$… · today $… · tok ds …↑/…↓ · opus …↑/…↓`. Off-path the advisor columns/fields are 0 and the
+display collapses to a single model — unchanged.
 
 - **single** — one DeepSeek call with `SYSTEM_PROMPT`. The legacy path; tests pin to it. Stays
   pure diff-only (no planner/fetch).
