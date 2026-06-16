@@ -21,6 +21,11 @@ review as a comment using a **dedicated bot GitHub account**.
 - **@mention to re-review:** comment `@<bot_login>` on a PR and the bot runs a fresh
   review on the next poll — no new commit needed (toggle `review.rereview_on_mention`,
   default on). Otherwise it only reviews on a new commit (deduped by head SHA).
+- **Claude Opus advisor (optional):** set `review.advisor_provider: claude` to route the
+  planner + scoring passes to Claude Opus via the `claude -p` CLI — using your Claude
+  **subscription** (not API credits) for cross-model verification and lower DeepSeek spend.
+  Lenses stay on DeepSeek. Needs a logged-in `claude` CLI and the `claude:` config block;
+  restart to apply. Default off (DeepSeek does everything).
 - Skips drafts, ignored authors, and its own PRs; skips noisy files and caps
   diff size + a rolling 24h USD budget.
 

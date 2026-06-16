@@ -59,6 +59,21 @@ model notices the gap. On by default (`review.fetch_referenced_context`); sized 
 `referenced_max_symbols` / `referenced_context_max_chars` / `referenced_search_limit`. The planner's
 usage is aggregated into the review cost. This is the one place multi relaxes diff-only.
 
+**Advisor provider (multi only).** `review.advisor_provider` (default `deepseek`) routes the
+**planner + scoring** passes to Claude Opus via the `claude -p` CLI (`ghcr/claude_cli.py`,
+`ClaudeCliClient`) — leveraging a Claude **subscription** (CLI OAuth, not API credits) instead of
+DeepSeek tokens. **Lenses stay on DeepSeek** (the bulk finder). Two wins: cross-model verification
+(a *different* model refutes a finding than raised it — now "agreement isn't verification" holds for
+real), and DeepSeek's dominant token cost (scoring = findings×votes) drops to $0. The orchestrator
+holds two clients — `self.deepseek` (worker: lenses + single mode) and `self.advisor` (planner +
+scoring); when `advisor_provider` is `deepseek`, `self.advisor IS self.deepseek` and cost/behavior is
+byte-for-byte unchanged. Cost is split into two provider-priced buckets (`_split_cost`): worker usage
+× `deepseek.prices`, advisor usage × `claude.prices` (default 0/0 → $0, budget never blocks).
+`ClaudeCliError ⊂ DeepSeekError`, so the existing best-effort planner/scoring catches degrade a CLI
+failure gracefully. The advisor client is built once at startup (`cli._build`) — **restart-only**;
+flipping `advisor_provider` live has no effect until restart. Off by default; configured via the
+`claude:` block (`claude_path`/`model`/`request_timeout_seconds`/`prices`).
+
 - **single** — one DeepSeek call with `SYSTEM_PROMPT`. The legacy path; tests pin to it. Stays
   pure diff-only (no planner/fetch).
 - **multi** (default) — accuracy-first, modeled on Claude Code's `/code-review`, adapted to

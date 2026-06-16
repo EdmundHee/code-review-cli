@@ -80,6 +80,22 @@ review:
   prior_comment_max_chars: 6000       # budget for the rendered prior-discussion block
   rereview_on_mention: true           # a new comment that @mentions the bot triggers a fresh
                                       # full review (no new commit needed). false to disable.
+  advisor_provider: deepseek          # deepseek (default) | claude. "claude" routes the
+                                      # planner + scoring passes to Claude Opus via the
+                                      # `claude -p` CLI (your subscription), leaving lenses
+                                      # on DeepSeek — cross-model verification + lower
+                                      # DeepSeek token cost. Requires the `claude:` block
+                                      # below and a logged-in `claude` CLI. Restart to apply.
+
+# Only used when review.advisor_provider: claude. Auth comes from the Claude CLI's own
+# login (a subscription), NOT an API key — run `claude` once interactively to log in.
+claude:
+  claude_path: claude                 # path to the Claude Code CLI (on PATH by default)
+  model: opus                         # model alias passed to `claude -p --model`
+  request_timeout_seconds: 600
+  prices:                             # USD per 1M tokens — subscription is flat, so 0/0
+    input_per_1m: 0.0                 # → advisor passes are reported as $0 (budget never blocks)
+    output_per_1m: 0.0
 
 storage:
   db_path: ~/.local/state/ghcr/ghcr.db
