@@ -78,13 +78,16 @@ class ReviewOutcome:
 
 
 class ReviewOrchestrator:
-    def __init__(self, gh, deepseek, store, config: Config, now=None, bus=None):
+    def __init__(self, gh, deepseek, store, config: Config, now=None, bus=None, advisor=None):
         self.gh = gh
-        self.deepseek = deepseek
+        self.deepseek = deepseek            # worker: lenses + single mode
+        self.advisor = advisor or deepseek   # planner + scoring (defaults to worker)
         self.store = store
         self.cfg = config
         self.bus = bus
         self._now = now or (lambda: datetime.now(timezone.utc))
+        self.worker_prices = config.deepseek.prices
+        self.advisor_prices = getattr(self.advisor, "prices", config.deepseek.prices)
 
     # -- decision (no spend, no DB write) --------------------------------
     def decide(self, pr: PullRequest) -> ReviewDecision:
@@ -175,7 +178,7 @@ class ReviewOrchestrator:
                 latency_s=latency_s, snippet=result.content[:280], title=pr.title,
             ))
 
-        cost = estimate_cost_usd(result.usage, self.cfg.deepseek.prices)
+        cost = estimate_cost_usd(result.usage, self.worker_prices)
         body = comment_mod.build_comment(
             content=result.content,
             pr=pr,
@@ -235,7 +238,7 @@ class ReviewOrchestrator:
         try:
             # thinking disabled: listing symbols needs no deep reasoning, and the
             # reasoning tokens bill as output — the planner is pure overhead there.
-            res = self.deepseek.review(
+            res = self.advisor.review(
                 CONTEXT_REQUEST_PROMPT, build_context_request_user_prompt(pr, fd), thinking="disabled"
             )
         except DeepSeekError as e:
@@ -358,15 +361,16 @@ class ReviewOrchestrator:
             lenses, lambda ln: self._run_one_lens(ln, pr, fd, user_prompt, has_source, has_test)
         )
 
-        usages: list[Usage] = list(ref_usages) + [lr.usage for lr in lens_results]
+        worker_usages: list[Usage] = [lr.usage for lr in lens_results]
+        advisor_usages: list[Usage] = list(ref_usages)
         lens_errors = [lr.lens for lr in lens_results if not lr.ok]
         coverage = next((lr.coverage for lr in lens_results if lr.coverage is not None), None)
         raw_findings = [f for lr in lens_results if lr.ok for f in lr.findings]
 
         # Every lens failed → record error (cost still counted), do not post.
         if len(lens_errors) == len(lenses):
-            usage = merge_usages(usages)
-            cost = estimate_cost_usd(usage, self.cfg.deepseek.prices)
+            usage = merge_usages(worker_usages + advisor_usages)
+            cost = self._split_cost(worker_usages, advisor_usages)
             if not dry_run:
                 self.store.record(
                     pr.repo, pr.number, pr.head_sha, ACTION_ERROR,
@@ -383,7 +387,7 @@ class ReviewOrchestrator:
         if findings:
             scored = self._map_parallel(findings, lambda f: self._score_finding(f, pr, fd, rc.scoring_votes, prior_ctx, ref_ctx))
             for f, conf, reason, score_usages in scored:
-                usages.extend(score_usages)
+                advisor_usages.extend(score_usages)
                 if conf is None:
                     continue
                 scored_total += 1  # got a score → counts toward the dropped tally
@@ -392,8 +396,8 @@ class ReviewOrchestrator:
             survivors.sort(key=lambda f: (_SEV_RANK.get(f.severity, 9), f.id))
 
         latency_s = time.monotonic() - t0
-        usage = merge_usages(usages)
-        cost = estimate_cost_usd(usage, self.cfg.deepseek.prices)
+        usage = merge_usages(worker_usages + advisor_usages)
+        cost = self._split_cost(worker_usages, advisor_usages)
         content = synthesize_markdown(
             survivors, coverage, lens_errors=lens_errors,
             scored_total=scored_total, threshold=rc.confidence_threshold,
@@ -428,6 +432,14 @@ class ReviewOrchestrator:
             comment_url=url, usage=usage, cost_usd=cost, model=model,
         )
         return ReviewOutcome(ACTION_REVIEW, cost_usd=cost, comment_url=url)
+
+    def _split_cost(self, worker_usages, advisor_usages) -> float:
+        """Bill each provider's usage at its own price. When advisor IS the worker
+        (default), both prices are deepseek's → identical to a single-price total."""
+        return (
+            estimate_cost_usd(merge_usages(worker_usages), self.worker_prices)
+            + estimate_cost_usd(merge_usages(advisor_usages), self.advisor_prices)
+        )
 
     def _map_parallel(self, items, fn):
         """Run ``fn`` over ``items`` concurrently, preserving order. Workers must
@@ -481,7 +493,7 @@ class ReviewOrchestrator:
         usages: list[Usage] = []
         for _ in range(votes):
             try:
-                res = self.deepseek.review(SCORING_SYSTEM_PROMPT, user)
+                res = self.advisor.review(SCORING_SYSTEM_PROMPT, user)
             except DeepSeekError:
                 continue
             usages.append(res.usage)
