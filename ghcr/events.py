@@ -41,11 +41,13 @@ class RepoDone:
 class DeepSeekDone:
     repo: str
     pr_number: int
-    prompt_tokens: int
-    completion_tokens: int
+    prompt_tokens: int      # worker (DeepSeek lenses) portion only
+    completion_tokens: int  # worker (DeepSeek lenses) portion only
     latency_s: float
     snippet: str
     title: str = ""
+    advisor_prompt_tokens: int = 0      # advisor (Claude) portion; 0 when advisor==worker
+    advisor_completion_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,7 @@ class AgentEvent:
     status: str  # "running" | "done" | "failed"
     detail: str = ""
     title: str = ""
+    model: str = ""  # the model that ran this sub-agent (worker or advisor)
 
 
 @dataclass(frozen=True)

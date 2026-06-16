@@ -55,7 +55,7 @@ def _advisor_responses():
     }
 
 
-def _orch_hybrid(tmp_path):
+def _orch_hybrid(tmp_path, ds=None, advisor=None, bus=None):
     """Build an orchestrator with a real advisor separate from the worker."""
     cfg = make_config(
         db_path=str(tmp_path / "ghcr.db"),
@@ -67,17 +67,21 @@ def _orch_hybrid(tmp_path):
     )
     store = StateStore(cfg.db_path)
     gh = FakeGhClient(diff=SRC_DIFF)
-    ds = FakeDeepSeekClient(responses=_ds_responses())
-    advisor = FakeClaudeCliClient(responses=_advisor_responses())
-    orch = ReviewOrchestrator(gh, ds, store, cfg, now=lambda: FIXED, advisor=advisor)
-    return orch, store, gh, ds, advisor, cfg
+    if ds is None:
+        ds = FakeDeepSeekClient(responses=_ds_responses())
+    if advisor is None:
+        advisor = FakeClaudeCliClient(responses=_advisor_responses())
+    orch = ReviewOrchestrator(gh, ds, store, cfg, now=lambda: FIXED, advisor=advisor, bus=bus)
+    return orch, gh, cfg
 
 
 # ---------------------------------------------------------------------------
 # Test 1: routing — planner+scoring go to advisor; lenses stay on deepseek.
 # ---------------------------------------------------------------------------
 def test_planner_and_scoring_route_to_advisor(tmp_path):
-    orch, store, gh, ds, advisor, _cfg = _orch_hybrid(tmp_path)
+    ds = FakeDeepSeekClient(responses=_ds_responses())
+    advisor = FakeClaudeCliClient(responses=_advisor_responses())
+    orch, gh, _cfg = _orch_hybrid(tmp_path, ds=ds, advisor=advisor)
     out = orch.review_pr(make_pr())
 
     assert out.action == "review", f"Expected review, got {out.action}"
@@ -103,7 +107,9 @@ def test_planner_and_scoring_route_to_advisor(tmp_path):
 # Test 2: cost — advisor tokens (prices=0,0) are excluded from cost_usd.
 # ---------------------------------------------------------------------------
 def test_advisor_tokens_billed_at_zero(tmp_path):
-    orch, store, gh, ds, advisor, cfg = _orch_hybrid(tmp_path)
+    ds = FakeDeepSeekClient(responses=_ds_responses())
+    advisor = FakeClaudeCliClient(responses=_advisor_responses())
+    orch, gh, cfg = _orch_hybrid(tmp_path, ds=ds, advisor=advisor)
     out = orch.review_pr(make_pr())
 
     assert out.action == "review"
@@ -198,3 +204,74 @@ def test_advisor_failure_still_posts_review(tmp_path):
     assert gh.posted, "a comment must still be posted when the advisor fails"
     # The advisor was actually exercised (planner + scoring attempts), all raising.
     assert advisor.calls >= 1
+
+
+# ---------------------------------------------------------------------------
+# Helpers for new split-token tests.
+# ---------------------------------------------------------------------------
+
+class _CaptureBus:
+    def __init__(self):
+        self.events = []
+
+    def publish(self, evt):
+        self.events.append(evt)
+
+
+# ---------------------------------------------------------------------------
+# Test 5: DeepSeekDone carries per-provider split.
+# ---------------------------------------------------------------------------
+def test_deepseekdone_carries_provider_split(tmp_path):
+    from ghcr.events import DeepSeekDone, AgentEvent
+    ds = FakeDeepSeekClient(responses={
+        "## LENS: correctness": CORR,
+        "## LENS: security": EMPTY,
+        "## LENS: maintainability": EMPTY,
+        "## LENS: test_coverage": COV,
+    })
+    advisor = FakeClaudeCliClient(responses={
+        "## PASS: context": PLANNER_EMPTY,
+        "## PASS: scoring": SCORE,
+    })
+    bus = _CaptureBus()
+    orch, gh, cfg = _orch_hybrid(tmp_path, ds=ds, advisor=advisor, bus=bus)
+    orch.review_pr(make_pr())
+
+    done_events = [e for e in bus.events if isinstance(e, DeepSeekDone)]
+    assert len(done_events) == 1, "expected exactly one DeepSeekDone"
+    done = done_events[0]
+
+    # prompt_tokens is now WORKER-only (lenses on deepseek)
+    lens_calls = ds.calls_matching("## LENS:")
+    assert done.prompt_tokens == ds.usage.prompt_tokens * lens_calls
+    # advisor tokens are positive (planner + scoring on claude)
+    assert done.advisor_prompt_tokens > 0
+
+    agents = [e for e in bus.events if isinstance(e, AgentEvent)]
+    assert any(a.agent.startswith("score") and a.model == "opus" for a in agents), \
+        "scoring agents must carry advisor model"
+    assert any(a.agent.startswith("lens:") and a.model == "deepseek-v4-pro" for a in agents), \
+        "lens agents must carry worker model"
+
+
+# ---------------------------------------------------------------------------
+# Test 6: record persists the provider split.
+# ---------------------------------------------------------------------------
+def test_record_persists_split(tmp_path):
+    ds = FakeDeepSeekClient(responses={
+        "## LENS: correctness": CORR,
+        "## LENS: security": EMPTY,
+        "## LENS: maintainability": EMPTY,
+        "## LENS: test_coverage": COV,
+    })
+    advisor = FakeClaudeCliClient(responses={
+        "## PASS: context": PLANNER_EMPTY,
+        "## PASS: scoring": SCORE,
+    })
+    orch, gh, cfg = _orch_hybrid(tmp_path, ds=ds, advisor=advisor)
+    orch.review_pr(make_pr())
+
+    from datetime import datetime, timedelta, timezone
+    tok = orch.store.tokens_spent_since(datetime.now(timezone.utc) - timedelta(hours=24))
+    assert tok.advisor_prompt > 0, "advisor prompt tokens must be persisted"
+    assert tok.worker_prompt > 0, "worker prompt tokens must be persisted"

@@ -182,11 +182,13 @@ class FakeDeepSeekClient:
     log are lock-guarded because the multi-pass pipeline calls from a thread pool.
     """
 
-    def __init__(self, *, content="## Summary\nlooks fine", usage=None, raises=False, responses=None):
+    def __init__(self, *, content="## Summary\nlooks fine", usage=None, raises=False, responses=None,
+                 model: str = "deepseek-v4-pro"):
         self.content = content
         self.usage = usage or Usage(prompt_tokens=1000, completion_tokens=500, total_tokens=1500)
         self.raises = raises
         self.responses = responses or {}
+        self.model = model
         self._lock = threading.Lock()
         self.calls = 0
         self.systems: list[str] = []
@@ -231,12 +233,14 @@ class FakeClaudeCliClient:
     plus a ``prices`` attr (0/0) so the cost split bills it at $0. Lock-guarded
     because scoring calls it from the thread pool."""
 
-    def __init__(self, *, content="## Summary\nadvisor ok", usage=None, raises=False, responses=None):
+    def __init__(self, *, content="## Summary\nadvisor ok", usage=None, raises=False, responses=None,
+                 model: str = "opus"):
         self.content = content
         self.usage = usage or Usage(prompt_tokens=200, completion_tokens=100, total_tokens=300)
         self.raises = raises
         self.responses = responses or {}
         self.prices = Prices(0.0, 0.0)
+        self.model = model
         self._lock = threading.Lock()
         self.calls = 0
         self.systems: list[str] = []

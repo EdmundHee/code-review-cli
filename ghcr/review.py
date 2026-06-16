@@ -369,12 +369,13 @@ class ReviewOrchestrator:
 
         # Every lens failed → record error (cost still counted), do not post.
         if len(lens_errors) == len(lenses):
-            usage = merge_usages(worker_usages + advisor_usages)
+            worker_u, advisor_u = self._provider_usage(worker_usages, advisor_usages)
             cost = self._split_cost(worker_usages, advisor_usages)
             if not dry_run:
                 self.store.record(
                     pr.repo, pr.number, pr.head_sha, ACTION_ERROR,
-                    model=model, usage=usage, cost_usd=cost, error="all review lenses failed",
+                    model=model, usage=worker_u, advisor_usage=advisor_u,
+                    cost_usd=cost, error="all review lenses failed",
                 )
             log.error("all lenses failed repo=%s pr=%s", pr.repo, pr.number)
             return ReviewOutcome(ACTION_ERROR, cost_usd=cost)
@@ -396,7 +397,7 @@ class ReviewOrchestrator:
             survivors.sort(key=lambda f: (_SEV_RANK.get(f.severity, 9), f.id))
 
         latency_s = time.monotonic() - t0
-        usage = merge_usages(worker_usages + advisor_usages)
+        worker_u, advisor_u = self._provider_usage(worker_usages, advisor_usages)
         cost = self._split_cost(worker_usages, advisor_usages)
         content = synthesize_markdown(
             survivors, coverage, lens_errors=lens_errors,
@@ -406,7 +407,8 @@ class ReviewOrchestrator:
         if self.bus:
             self.bus.publish(DeepSeekDone(
                 repo=pr.repo, pr_number=pr.number,
-                prompt_tokens=usage.prompt_tokens, completion_tokens=usage.completion_tokens,
+                prompt_tokens=worker_u.prompt_tokens, completion_tokens=worker_u.completion_tokens,
+                advisor_prompt_tokens=advisor_u.prompt_tokens, advisor_completion_tokens=advisor_u.completion_tokens,
                 latency_s=latency_s, snippet=content[:280], title=pr.title,
             ))
 
@@ -423,15 +425,24 @@ class ReviewOrchestrator:
         try:
             url = self.gh.post_comment(pr.repo, pr.number, body)
         except GhError as e:
-            self.store.record(pr.repo, pr.number, pr.head_sha, ACTION_ERROR, model=model, usage=usage, cost_usd=cost, error=str(e))
+            self.store.record(pr.repo, pr.number, pr.head_sha, ACTION_ERROR, model=model,
+                              usage=worker_u, advisor_usage=advisor_u, cost_usd=cost, error=str(e))
             log.error("post failed repo=%s pr=%s: %s", pr.repo, pr.number, e)
             return ReviewOutcome(ACTION_ERROR, cost_usd=cost)
 
         self.store.record(
             pr.repo, pr.number, pr.head_sha, record_outcome,
-            comment_url=url, usage=usage, cost_usd=cost, model=model,
+            comment_url=url, usage=worker_u, advisor_usage=advisor_u, cost_usd=cost, model=model,
         )
         return ReviewOutcome(ACTION_REVIEW, cost_usd=cost, comment_url=url)
+
+    def _provider_usage(self, worker_usages, advisor_usages):
+        """Split usage by real provider. When there is no DISTINCT advisor (advisor IS
+        the worker), planner+scoring tokens are the worker's — fold them in and report
+        zero advisor usage, so a DeepSeek-only review shows no phantom advisor tokens."""
+        if self.advisor is self.deepseek:
+            return merge_usages(worker_usages + advisor_usages), Usage()
+        return merge_usages(worker_usages), merge_usages(advisor_usages)
 
     def _split_cost(self, worker_usages, advisor_usages) -> float:
         """Bill each provider's usage at its own price. When advisor IS the worker
@@ -452,10 +463,18 @@ class ReviewOrchestrator:
 
     def _emit_agent(self, pr, agent: str, status: str, detail: str = "") -> None:
         """Publish a sub-agent state change for the TUI. Safe from pool threads —
-        the bus is thread-safe; no store access here."""
+        the bus is thread-safe; no store access here. Model derived from the agent
+        kind: scorers (``score:*``) and the planner (``context``) run on the advisor;
+        lenses run on the worker."""
         if self.bus:
+            model = (
+                self.advisor.model
+                if (agent.startswith("score") or agent == "context")
+                else self.deepseek.model
+            )
             self.bus.publish(AgentEvent(
-                repo=pr.repo, pr_number=pr.number, agent=agent, status=status, detail=detail, title=pr.title,
+                repo=pr.repo, pr_number=pr.number, agent=agent, status=status,
+                detail=detail, title=pr.title, model=model,
             ))
 
     def _run_one_lens(self, lens: str, pr, fd, user_prompt: str, has_source: bool, has_test: bool) -> LensResult:

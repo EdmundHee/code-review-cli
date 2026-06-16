@@ -86,6 +86,8 @@ def test_planner_usage_counted_in_cost(tmp_path):
     # planner(1) + 4 lenses + 1 score = 6 calls, each 1000/500 tokens
     assert ds.calls == 6
     row = store.recent(1)[0]
+    # Default (deepseek) path: advisor IS the worker, so planner+scoring fold into the
+    # worker total — prompt_tokens is the FULL review (all 6 DeepSeek calls).
     assert row["prompt_tokens"] == 6000 and row["completion_tokens"] == 3000
 
 

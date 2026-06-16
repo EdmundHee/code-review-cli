@@ -57,8 +57,41 @@ def test_happy_path_fans_out_scores_and_posts(tmp_path):
     assert "[BLOCKER]" in body and "confidence 95" in body
     row = store.recent(1)[0]
     assert row["outcome"] == "reviewed"
+    # Default (deepseek) path: advisor IS the worker, so scoring folds into the worker
+    # total — prompt_tokens is the FULL review (4 lenses + 1 score).
     assert row["prompt_tokens"] == 5000 and row["completion_tokens"] == 2500
     assert store.already_reviewed("owner/repo", 1, "a" * 40)
+
+
+def test_default_path_reports_no_phantom_advisor_tokens(tmp_path):
+    """Default config (advisor_provider=deepseek) has no DISTINCT advisor: planner +
+    scoring tokens are DeepSeek's own. The split must fold them into the worker total
+    and publish ZERO advisor tokens — no phantom Opus usage when no Opus ran."""
+    from ghcr.events import DeepSeekDone
+
+    class _CaptureBus:
+        def __init__(self):
+            self.events = []
+
+        def publish(self, evt):
+            self.events.append(evt)
+
+    bus = _CaptureBus()
+    gh = FakeGhClient(diff=SRC_DIFF)
+    ds = FakeDeepSeekClient(responses=_responses())
+    cfg = make_config(db_path=str(tmp_path / "ghcr.db"), review_mode="multi")
+    store = StateStore(cfg.db_path)
+    orch = ReviewOrchestrator(gh, ds, store, cfg, now=lambda: FIXED, bus=bus)
+    out = orch.review_pr(make_pr())
+    assert out.action == "review"
+
+    done = [e for e in bus.events if isinstance(e, DeepSeekDone)][0]
+    # All 5 DeepSeek calls (4 lenses + 1 score) fold into the worker total.
+    assert done.prompt_tokens == ds.usage.prompt_tokens * ds.calls
+    assert done.completion_tokens == ds.usage.completion_tokens * ds.calls
+    # No distinct advisor ran → zero advisor tokens.
+    assert done.advisor_prompt_tokens == 0
+    assert done.advisor_completion_tokens == 0
 
 
 def test_below_threshold_findings_filtered_but_still_posts(tmp_path):
