@@ -74,6 +74,18 @@ failure gracefully. The advisor client is built once at startup (`cli._build`) �
 flipping `advisor_provider` live has no effect until restart. Off by default; configured via the
 `claude:` block (`claude_path`/`model`/`request_timeout_seconds`/`prices`).
 
+**Per-provider usage in the TUI.** Tokens are tracked split by **real provider** — worker (DeepSeek,
+lenses) vs advisor (Claude, planner+scoring). `_provider_usage` attributes by the *actual* provider,
+not the cost bucket: when `self.advisor IS self.deepseek` (off-path), planner+scoring tokens fold into
+the worker total and advisor tokens are 0 — so a DeepSeek-only review shows no phantom Opus usage.
+`DeepSeekDone` carries both (`prompt_tokens`/`completion_tokens` = worker; `advisor_*` = advisor),
+`AgentEvent.model` tags which model ran each sub-agent (`score:#3 · opus`), and the split is
+**persisted** on the `reviews` row (`advisor_prompt_tokens`/`advisor_completion_tokens`; schema v2 via
+an idempotent, column-guarded `ALTER` migration in `StateStore._migrate`). The TUI seeds 24h
+per-provider totals from `tokens_spent_since` (→ `ProviderTokens`) and shows both models +
+`tok ds …↑/…↓ · opus …↑/…↓`. Off-path the advisor columns/fields are 0 and the display collapses to a
+single model — unchanged.
+
 - **single** — one DeepSeek call with `SYSTEM_PROMPT`. The legacy path; tests pin to it. Stays
   pure diff-only (no planner/fetch).
 - **multi** (default) — accuracy-first, modeled on Claude Code's `/code-review`, adapted to
