@@ -50,6 +50,7 @@ def make_config(
     referenced_max_symbols: int = 6,
     referenced_context_max_chars: int = 6000,
     referenced_search_limit: int = 5,
+    advisor_provider: str = "deepseek",
 ) -> Config:
     return Config(
         github=GithubConfig(gh_path="/usr/bin/true", token="t", bot_login=bot_login, request_timeout_seconds=60),
@@ -86,6 +87,7 @@ def make_config(
             referenced_max_symbols=referenced_max_symbols,
             referenced_context_max_chars=referenced_context_max_chars,
             referenced_search_limit=referenced_search_limit,
+            advisor_provider=advisor_provider,
         ),
         db_path=db_path,
         log_level="INFO",
@@ -222,3 +224,41 @@ class FakeDeepSeekClient:
         """Per-call thinking overrides paired with matching system prompts."""
         with self._lock:
             return [t for s, t in zip(self.systems, self.thinkings) if sys_substr in s]
+
+
+class FakeClaudeCliClient:
+    """Advisor double — same system-prompt-substring routing as FakeDeepSeekClient,
+    plus a ``prices`` attr (0/0) so the cost split bills it at $0. Lock-guarded
+    because scoring calls it from the thread pool."""
+
+    def __init__(self, *, content="## Summary\nadvisor ok", usage=None, raises=False, responses=None):
+        self.content = content
+        self.usage = usage or Usage(prompt_tokens=200, completion_tokens=100, total_tokens=300)
+        self.raises = raises
+        self.responses = responses or {}
+        self.prices = Prices(0.0, 0.0)
+        self._lock = threading.Lock()
+        self.calls = 0
+        self.systems: list[str] = []
+        self.users: list[str] = []
+
+    def review(self, system_prompt, user_prompt, *, thinking=None):
+        with self._lock:
+            self.calls += 1
+            self.systems.append(system_prompt)
+            self.users.append(user_prompt)
+        if self.raises:
+            from ghcr.claude_cli import ClaudeCliError
+
+            raise ClaudeCliError("claude down")
+        return ReviewResult(content=self._route(system_prompt, user_prompt), usage=self.usage, model="opus")
+
+    def _route(self, system_prompt, user_prompt):
+        for key, val in self.responses.items():
+            if key in system_prompt:
+                return val(system_prompt, user_prompt) if callable(val) else val
+        return self.content
+
+    def calls_matching(self, substr: str) -> int:
+        with self._lock:
+            return sum(1 for s in self.systems if substr in s)
