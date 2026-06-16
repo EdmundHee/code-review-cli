@@ -233,3 +233,52 @@ def test_monitoring_renders_review_progress(tmp_path):
     state.apply(RepoListed(repo="owner/repo", open_prs=2))
     state.apply(AgentEvent(repo="owner/repo", pr_number=50, agent="lens:correctness", status="running"))
     assert "reviewing #50" in _render(state)
+
+
+# -- per-provider token tracking tests ----------------------------------------
+
+from ghcr.models import ProviderTokens
+
+
+def _pstate(**kw):
+    return DashboardState(make_config(db_path=":memory:", **kw))
+
+
+def test_seed_sets_24h_provider_tokens():
+    st = _pstate(advisor_provider="claude")
+    st.seed([], spent_24h=0.0, tokens_24h=ProviderTokens(100, 40, 10, 5))
+    assert st.tok24_wp == 100 and st.tok24_wc == 40
+    assert st.tok24_ap == 10 and st.tok24_ac == 5
+
+
+def test_deepseekdone_accumulates_provider_tokens():
+    st = _pstate()
+    st.seed([], spent_24h=0.0, tokens_24h=ProviderTokens(0, 0, 0, 0))
+    st.apply(DeepSeekDone(repo="o/r", pr_number=1, prompt_tokens=50, completion_tokens=20,
+                          latency_s=1.0, snippet="x", advisor_prompt_tokens=8, advisor_completion_tokens=3))
+    assert st.tok24_wp == 50 and st.tok24_wc == 20
+    assert st.tok24_ap == 8 and st.tok24_ac == 3
+    assert st.sess_wp == 50 and st.sess_ap == 8
+    assert st.sess_wc == 20 and st.sess_ac == 3
+
+
+def test_advisor_model_off_path_equals_worker():
+    st = _pstate()  # advisor_provider defaults to deepseek
+    assert st.advisor_model == st.model
+
+
+def test_seed_without_tokens_arg_is_safe():
+    st = _pstate()
+    st.seed([], spent_24h=1.0)  # tokens_24h omitted → defaults, no crash
+    assert st.tok24_wp == 0
+
+
+def test_header_shows_both_models_and_opus_tokens_when_hybrid():
+    from ghcr.tui import _header
+    st = _pstate()
+    st.advisor_model = "opus"          # force a distinct advisor (make_config can't build cfg.claude)
+    st.seed([], spent_24h=0.0, tokens_24h=ProviderTokens(1200, 400, 180, 95))
+    panel = _header(st)
+    text = panel.renderable.plain if hasattr(panel.renderable, "plain") else str(panel.renderable)
+    assert "opus" in text and st.model in text   # both models shown
+    assert "ds " in text                          # per-provider token line present

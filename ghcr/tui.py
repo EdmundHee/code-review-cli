@@ -103,13 +103,25 @@ class DashboardState:
         self.cost_rows: deque = deque(maxlen=50)
         self.events: deque = deque(maxlen=200)
         self.spent_24h = 0.0
+        # Per-provider token tracking. 24h (seeded from DB, kept live) + session (since
+        # TUI start). wp/wc = worker (DeepSeek), ap/ac = advisor (Claude).
+        self.tok24_wp = self.tok24_wc = self.tok24_ap = self.tok24_ac = 0
+        self.sess_wp = self.sess_wc = self.sess_ap = self.sess_ac = 0
+        self.advisor_model = (
+            cfg.claude.model
+            if cfg.review.advisor_provider == "claude" and cfg.claude is not None
+            else cfg.deepseek.model
+        )
         # Live sub-agents (lenses + scorers) for the PR currently under review.
         self.agents_pr: tuple | None = None
         self.agents: dict[str, dict] = {}
 
     # -- seeding (main thread, before the worker starts) -----------------
-    def seed(self, rows, spent_24h: float) -> None:
+    def seed(self, rows, spent_24h: float, tokens_24h=None) -> None:
         self.spent_24h = spent_24h
+        if tokens_24h is not None:
+            self.tok24_wp, self.tok24_wc = tokens_24h.worker_prompt, tokens_24h.worker_completion
+            self.tok24_ap, self.tok24_ac = tokens_24h.advisor_prompt, tokens_24h.advisor_completion
         for row in reversed(list(rows)):  # oldest first so newest ends up last
             repo, num = row["repo"], row["pr_number"]
             outcome, cost = row["outcome"], float(row["cost_usd"] or 0.0)
@@ -161,9 +173,18 @@ def reduce(state: DashboardState, evt: object) -> None:
             state.events.append(f"{_hhmmss(_utcnow())} {evt.repo}#{evt.pr_number} {evt.agent} failed: {evt.detail}")
     elif isinstance(evt, DeepSeekDone):
         state.latest = evt
+        state.tok24_wp += evt.prompt_tokens
+        state.tok24_wc += evt.completion_tokens
+        state.tok24_ap += evt.advisor_prompt_tokens
+        state.tok24_ac += evt.advisor_completion_tokens
+        state.sess_wp += evt.prompt_tokens
+        state.sess_wc += evt.completion_tokens
+        state.sess_ap += evt.advisor_prompt_tokens
+        state.sess_ac += evt.advisor_completion_tokens
+        adv = f" · opus {evt.advisor_prompt_tokens}→{evt.advisor_completion_tokens}" if evt.advisor_prompt_tokens else ""
         state.events.append(
             f"{_hhmmss(_utcnow())} deepseek {evt.repo}#{evt.pr_number} "
-            f"{evt.prompt_tokens}→{evt.completion_tokens} tok ({evt.latency_s:.1f}s)"
+            f"{evt.prompt_tokens}→{evt.completion_tokens} tok{adv} ({evt.latency_s:.1f}s)"
         )
     elif isinstance(evt, PrOutcome):
         if evt.repo not in state.repos:
@@ -189,16 +210,30 @@ def reduce(state: DashboardState, evt: object) -> None:
 
 # -- rendering ----------------------------------------------------------------
 
+def _fmt_tok(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
+
+
 def _header(state: DashboardState) -> Panel:
     up = _fmt_uptime((_utcnow() - state.started_at).total_seconds())
     spent = state.spent_24h
     color = "red" if spent >= state.budget else "green"
+    hybrid = state.advisor_model != state.model
+    models = f"{state.model} + {state.advisor_model}" if hybrid else state.model
+    tok = f"ds {_fmt_tok(state.tok24_wp)}↑/{_fmt_tok(state.tok24_wc)}↓"
+    if hybrid:
+        tok += f" · opus {_fmt_tok(state.tok24_ap)}↑/{_fmt_tok(state.tok24_ac)}↓"
     text = Text.assemble(
         ("ghcr", "bold cyan"), " · ",
         (state.bot_login, "bold"), " · ",
-        (state.model, "magenta"), " · ",
+        (models, "magenta"), " · ",
         f"up {up}", " · ",
-        ("24h ", "dim"), (f"${spent:.3f}/${state.budget:.2f}", color),
+        ("24h ", "dim"), (f"${spent:.3f}/${state.budget:.2f}", color), " · ",
+        ("tok ", "dim"), (tok, "cyan"),
     )
     return Panel(text, border_style="cyan")
 
@@ -375,7 +410,7 @@ def run_tui(cfg: Config, config_path: str | None = None) -> int:
     # Seed once from the DB in the main thread, then never touch it here again.
     seed_store = StateStore(cfg.db_path)
     cutoff = _utcnow() - timedelta(hours=24)
-    state.seed(seed_store.recent(20), seed_store.usd_spent_since(cutoff))
+    state.seed(seed_store.recent(20), seed_store.usd_spent_since(cutoff), seed_store.tokens_spent_since(cutoff))
     seed_store.close()
 
     _reconfigure_logging(cfg, bus)
