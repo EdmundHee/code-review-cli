@@ -15,7 +15,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from .cost import Prices, estimate_cost_usd
-from .models import PullRequest, Usage
+from .models import ProviderTokens, PullRequest, Usage
 
 # Outcomes that mean "this SHA is handled; do not review again".
 SEEN_OUTCOMES = ("reviewed", "skip_oversized", "skip_budget", "skip_empty", "skip_baseline")
@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS reviews (
   comment_url TEXT,
   prompt_tokens INTEGER NOT NULL DEFAULT 0,
   completion_tokens INTEGER NOT NULL DEFAULT 0,
+  advisor_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  advisor_completion_tokens INTEGER NOT NULL DEFAULT 0,
   cost_usd REAL NOT NULL DEFAULT 0,
   model TEXT,
   error TEXT,
@@ -68,10 +70,24 @@ class StateStore:
         self.conn.execute(
             "INSERT OR IGNORE INTO schema_meta(k, v) VALUES('version', '1')"
         )
+        self._migrate()
         self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
+
+    def _migrate(self) -> None:
+        """Idempotent, column-guarded migration. Safe to run every startup. Adds the
+        per-provider advisor token columns to pre-feature DBs (fresh DBs already have
+        them from _SCHEMA, so the guard skips the ALTERs)."""
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(reviews)")}
+        if "advisor_prompt_tokens" not in cols:
+            self.conn.execute("ALTER TABLE reviews ADD COLUMN advisor_prompt_tokens INTEGER NOT NULL DEFAULT 0")
+        if "advisor_completion_tokens" not in cols:
+            self.conn.execute("ALTER TABLE reviews ADD COLUMN advisor_completion_tokens INTEGER NOT NULL DEFAULT 0")
+        self.conn.execute(
+            "INSERT INTO schema_meta(k, v) VALUES('version', '2') ON CONFLICT(k) DO UPDATE SET v='2'"
+        )
 
     def has_any(self) -> bool:
         return self.conn.execute("SELECT 1 FROM reviews LIMIT 1").fetchone() is not None
@@ -94,17 +110,20 @@ class StateStore:
         *,
         comment_url: str | None = None,
         usage: Usage | None = None,
+        advisor_usage: Usage | None = None,
         cost_usd: float = 0.0,
         model: str | None = None,
         error: str | None = None,
         created_at: str | None = None,
     ) -> None:
         u = usage or Usage()
+        au = advisor_usage or Usage()
         ts = created_at or _utcnow().isoformat()
         self.conn.execute(
             "INSERT INTO reviews(repo, pr_number, head_sha, outcome, comment_url, "
-            "prompt_tokens, completion_tokens, cost_usd, model, error, created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+            "prompt_tokens, completion_tokens, advisor_prompt_tokens, advisor_completion_tokens, "
+            "cost_usd, model, error, created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(repo, pr_number, head_sha) WHERE outcome='reviewed' DO NOTHING",
             (
                 repo,
@@ -114,6 +133,8 @@ class StateStore:
                 comment_url,
                 u.prompt_tokens,
                 u.completion_tokens,
+                au.prompt_tokens,
+                au.completion_tokens,
                 cost_usd,
                 model,
                 error,
@@ -150,6 +171,18 @@ class StateStore:
             (cutoff.isoformat(),),
         ).fetchone()
         return float(row["s"] or 0.0)
+
+    def tokens_spent_since(self, cutoff: datetime) -> ProviderTokens:
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(prompt_tokens),0) AS wp, COALESCE(SUM(completion_tokens),0) AS wc, "
+            "COALESCE(SUM(advisor_prompt_tokens),0) AS ap, COALESCE(SUM(advisor_completion_tokens),0) AS ac "
+            "FROM reviews WHERE created_at >= ?",
+            (cutoff.isoformat(),),
+        ).fetchone()
+        return ProviderTokens(
+            worker_prompt=int(row["wp"]), worker_completion=int(row["wc"]),
+            advisor_prompt=int(row["ap"]), advisor_completion=int(row["ac"]),
+        )
 
     def recent(self, limit: int = 20):
         return self.conn.execute(

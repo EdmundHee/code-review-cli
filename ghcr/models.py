@@ -51,6 +51,17 @@ class Usage:
     total_tokens: int = 0
 
 
+@dataclass(frozen=True)
+class ProviderTokens:
+    """Summed token counts split by provider (worker = DeepSeek, advisor = Claude),
+    e.g. the 24h totals read back from the store for the TUI."""
+
+    worker_prompt: int = 0
+    worker_completion: int = 0
+    advisor_prompt: int = 0
+    advisor_completion: int = 0
+
+
 def merge_usages(usages: Iterable[Usage]) -> Usage:
     """Sum a sequence of per-call Usage objects into one aggregate.
 
