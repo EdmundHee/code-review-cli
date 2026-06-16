@@ -9,6 +9,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from .config import Config, ConfigError, load_config
+from .claude_cli import ClaudeCliClient
 from .deepseek import DeepSeekClient
 from .github import GhClient, GhError
 from .poller import PollLoop, baseline_if_first_run, preflight
@@ -35,8 +36,16 @@ def _build(cfg: Config, bus=None):
         reasoning_effort=cfg.deepseek.reasoning_effort,
         timeout=cfg.deepseek.request_timeout_seconds,
     )
+    advisor = ds  # default: advisor is the DeepSeek worker
+    if cfg.review.advisor_provider == "claude":
+        advisor = ClaudeCliClient(
+            claude_path=cfg.claude.claude_path,
+            model=cfg.claude.model,
+            timeout=cfg.claude.request_timeout_seconds,
+            prices=cfg.claude.prices,
+        )
     store = StateStore(cfg.db_path)
-    orch = ReviewOrchestrator(gh, ds, store, cfg, bus=bus)
+    orch = ReviewOrchestrator(gh, ds, store, cfg, bus=bus, advisor=advisor)
     return gh, ds, store, orch
 
 
