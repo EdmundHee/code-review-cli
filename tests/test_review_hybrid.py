@@ -165,3 +165,36 @@ def test_default_advisor_is_worker_unchanged(tmp_path):
 
     # Cost is positive (deepseek prices > 0).
     assert out.cost_usd > 0
+
+
+# ---------------------------------------------------------------------------
+# Test 4: best-effort — a failing advisor (planner + all scoring votes raise
+# ClaudeCliError) must NOT fail the review; it degrades to diff-only / dropped
+# findings and STILL posts. Mirrors an expired claude subscription auth.
+# ---------------------------------------------------------------------------
+def test_advisor_failure_still_posts_review(tmp_path):
+    from ghcr.models import ACTION_REVIEW
+
+    cfg = make_config(
+        db_path=str(tmp_path / "ghcr.db"),
+        review_mode="multi",
+        scoring_votes=1,
+        confidence_threshold=0,
+        fetch_referenced_context=True,
+        advisor_provider="claude",
+    )
+    store = StateStore(cfg.db_path)
+    gh = FakeGhClient(diff=SRC_DIFF)
+    # Lenses run normally and produce at least one finding so the body is non-empty.
+    ds = FakeDeepSeekClient(responses=_ds_responses())
+    # The advisor raises on EVERY call: the planner and every scoring vote both fail.
+    advisor = FakeClaudeCliClient(raises=True)
+    orch = ReviewOrchestrator(gh, ds, store, cfg, now=lambda: FIXED, advisor=advisor)
+
+    out = orch.review_pr(make_pr())
+
+    # Best-effort: the claude failure degrades, it never blocks or fails the review.
+    assert out.action == ACTION_REVIEW, f"Expected review despite advisor failure, got {out.action}"
+    assert gh.posted, "a comment must still be posted when the advisor fails"
+    # The advisor was actually exercised (planner + scoring attempts), all raising.
+    assert advisor.calls >= 1
