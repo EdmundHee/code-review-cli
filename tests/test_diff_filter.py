@@ -1,5 +1,6 @@
 from ghcr.diff_filter import (
     count_changed_lines,
+    file_hunks,
     filter_diff,
     is_probably_binary,
     should_skip_file,
@@ -77,3 +78,14 @@ def test_empty_diff():
     assert split_into_file_diffs("") == []
     fd = filter_diff("", ["**/*.lock"])
     assert fd.changed_lines == 0 and fd.text == ""
+
+
+def test_file_hunks_slices_only_the_named_file():
+    out = file_hunks(SRC_AND_LOCK, "src/app.py")
+    assert "return 2" in out
+    assert "poetry.lock" not in out
+
+
+def test_file_hunks_none_when_path_absent_or_diff_empty():
+    assert file_hunks(SRC_AND_LOCK, "nope.py") is None
+    assert file_hunks("", "src/app.py") is None

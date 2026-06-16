@@ -116,23 +116,27 @@ def test_planner_failure_degrades_to_no_block(tmp_path):
     assert gh.file_calls == 0  # nothing parsed -> no resolution attempted
 
 
-def test_gh_failure_during_resolution_degrades(tmp_path):
+def test_gh_failure_during_resolution_lists_symbol_unresolved(tmp_path):
     gh = FakeGhClient(diff=SRC_DIFF, code_raises=True)  # search + file both raise GhError
     ds = FakeDeepSeekClient(responses=_responses())
     orch, store = _orch(tmp_path, gh, ds)
     out = orch.review_pr(make_pr())
     assert out.action == "review"  # gh failure must not fail the review
-    assert all("REFERENCED DEFINITIONS" not in u for u in ds.user_for("## LENS: correctness"))
+    # the failed lookup is surfaced as UNRESOLVED so the scorer's cap-at-25 can fire
+    lens_users = ds.user_for("## LENS: correctness")
+    assert lens_users and all("UNRESOLVED" in u and "BaseConnector" in u for u in lens_users)
 
 
-def test_unresolved_symbol_yields_no_block_but_still_reviews(tmp_path):
+def test_unresolved_symbol_listed_for_lens_and_scorer(tmp_path):
     # planner asks for a symbol that neither hint nor search can locate
     gh = FakeGhClient(diff=SRC_DIFF)  # no file_contents, empty search
     ds = FakeDeepSeekClient(responses=_responses())
     orch, store = _orch(tmp_path, gh, ds)
     out = orch.review_pr(make_pr())
     assert out.action == "review"
-    assert all("REFERENCED DEFINITIONS" not in u for u in ds.user_for("## LENS: correctness"))
+    for pass_key in ("## LENS: correctness", "## PASS: scoring"):
+        users = ds.user_for(pass_key)
+        assert users and all("UNRESOLVED" in u and "BaseConnector" in u for u in users)
 
 
 def test_fetch_disabled_skips_planner_and_gh(tmp_path):
@@ -191,6 +195,40 @@ def test_planner_disabled_emits_no_context_event(tmp_path):
     orch, _store, events = _orch_with_bus(tmp_path, gh, ds, fetch_referenced_context=False)
     orch.review_pr(make_pr())
     assert not [e for e in events if e.agent == "context"]
+
+
+def test_module_hint_candidates_resolve_js_paths(tmp_path):
+    # a JS-style relative hint must resolve by trying language extensions, not just .py
+    planner = '{"requests":[{"symbol":"helper","module_hint":"./utils/helpers"}]}'
+    gh = FakeGhClient(
+        diff=SRC_DIFF,
+        file_contents={"utils/helpers.ts": "export function helper(a) {\n  return a;\n}\n"},
+    )
+    ds = FakeDeepSeekClient(responses=_responses(planner=planner))
+    orch, store = _orch(tmp_path, gh, ds)
+    orch.review_pr(make_pr())
+    assert gh.search_calls == 0  # resolved from the hint, no search fallback
+    assert any("export function helper" in u for u in ds.user_for("## LENS: correctness"))
+
+
+def test_usage_only_snippet_is_marked_unverified(tmp_path):
+    # fetched file merely mentions the symbol — the snippet must not pose as a definition
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"db/base.py": "x = BaseConnector()\n"})
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds)
+    orch.review_pr(make_pr())
+    assert any("NOT a verified definition" in u for u in ds.user_for("## LENS: correctness"))
+
+
+def test_planner_runs_with_thinking_disabled(tmp_path):
+    # symbol listing needs no deep reasoning; lenses/scoring keep the client default
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"db/base.py": BASE_SRC})
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds)
+    orch.review_pr(make_pr())
+    assert ds.thinking_for("## PASS: context") == ["disabled"]
+    assert all(t is None for t in ds.thinking_for("## LENS: correctness"))
+    assert all(t is None for t in ds.thinking_for("## PASS: scoring"))
 
 
 def test_max_symbols_caps_resolution(tmp_path):

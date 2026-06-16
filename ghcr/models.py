@@ -86,12 +86,15 @@ class ContextRequest:
 
 @dataclass(frozen=True)
 class ReferencedSnippet:
-    """One resolved definition fetched from the repo, fed back to the reviewer as
-    authoritative ground truth for code the diff references but does not show."""
+    """One resolved snippet fetched from the repo for a symbol the diff references
+    but does not show. ``kind`` is "definition" (a recognized def/class/binding —
+    authoritative ground truth) or "usage" (only a mention window was found — must
+    NOT be presented as a verified definition)."""
 
     symbol: str
     path: str
     text: str
+    kind: str = "definition"  # "definition" | "usage"
 
 
 # -- multi-pass review pipeline types --------------------------------------

@@ -55,9 +55,12 @@ class DeepSeekClient:
         self.reasoning_effort = reasoning_effort
         self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
 
-    def review(self, system_prompt: str, user_prompt: str) -> ReviewResult:
+    def review(self, system_prompt: str, user_prompt: str, *, thinking: str | None = None) -> ReviewResult:
+        """One chat-completion call. ``thinking`` overrides the client default for
+        this call only — the planner pass runs "disabled" (symbol listing needs no
+        deep reasoning, and reasoning tokens bill as output)."""
         kwargs = build_request_kwargs(
-            self.model, self.thinking, self.reasoning_effort, system_prompt, user_prompt
+            self.model, thinking or self.thinking, self.reasoning_effort, system_prompt, user_prompt
         )
         try:
             resp = self._client.chat.completions.create(**kwargs)

@@ -189,12 +189,14 @@ class FakeDeepSeekClient:
         self.calls = 0
         self.systems: list[str] = []
         self.users: list[str] = []
+        self.thinkings: list[str | None] = []  # per-call thinking override (None = client default)
 
-    def review(self, system_prompt, user_prompt):
+    def review(self, system_prompt, user_prompt, *, thinking=None):
         with self._lock:
             self.calls += 1
             self.systems.append(system_prompt)
             self.users.append(user_prompt)
+            self.thinkings.append(thinking)
         if self.raises:
             from ghcr.deepseek import DeepSeekError
 
@@ -215,3 +217,8 @@ class FakeDeepSeekClient:
         """User prompts paired with system prompts containing ``sys_substr``."""
         with self._lock:
             return [u for s, u in zip(self.systems, self.users) if sys_substr in s]
+
+    def thinking_for(self, sys_substr: str) -> list[str | None]:
+        """Per-call thinking overrides paired with matching system prompts."""
+        with self._lock:
+            return [t for s, t in zip(self.systems, self.thinkings) if sys_substr in s]

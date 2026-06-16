@@ -105,6 +105,15 @@ def split_into_file_diffs(diff: str) -> list[FileDiff]:
     return out
 
 
+def file_hunks(diff: str, path: str) -> str | None:
+    """The diff section(s) for one file, or ``None`` when the path is absent.
+
+    Lets the scoring pass send a single finding's file hunks instead of re-sending
+    the whole diff on every vote."""
+    parts = [f.text for f in split_into_file_diffs(diff) if f.path == path]
+    return "".join(parts) or None
+
+
 def count_changed_lines(diff: str) -> int:
     added = removed = 0
     for ln in diff.splitlines():

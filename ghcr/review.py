@@ -40,8 +40,8 @@ from .models import (
     merge_usages,
 )
 from .context_request import (
-    extract_definition,
-    module_to_path,
+    extract_symbol_snippet,
+    module_path_candidates,
     parse_context_requests,
     render_referenced_context,
 )
@@ -233,14 +233,29 @@ class ReviewOrchestrator:
         # signal the row sits on bare "polling…" for its whole (~minute) duration.
         self._emit_agent(pr, "context", "running")
         try:
-            res = self.deepseek.review(CONTEXT_REQUEST_PROMPT, build_context_request_user_prompt(pr, fd))
+            # thinking disabled: listing symbols needs no deep reasoning, and the
+            # reasoning tokens bill as output — the planner is pure overhead there.
+            res = self.deepseek.review(
+                CONTEXT_REQUEST_PROMPT, build_context_request_user_prompt(pr, fd), thinking="disabled"
+            )
         except DeepSeekError as e:
             log.warning("context planner failed repo=%s pr=%s: %s", pr.repo, pr.number, e)
             self._emit_agent(pr, "context", "failed", "planner api error")
             return "", []
         requests = parse_context_requests(res.content)[: rc.referenced_max_symbols]
-        snippets = [s for s in (self._resolve_symbol(pr, req) for req in requests) if s]
-        block = render_referenced_context(snippets, max_chars=rc.referenced_context_max_chars)
+        snippets: list[ReferencedSnippet] = []
+        unresolved: list[str] = []
+        for req in requests:
+            s = self._resolve_symbol(pr, req)
+            if s:
+                snippets.append(s)
+            else:
+                # Surfaced in the rendered block: an unresolved symbol must stay
+                # visibly unknown so the scorer's cap-at-25 rule can fire on it.
+                unresolved.append(req.symbol)
+        block = render_referenced_context(
+            snippets, max_chars=rc.referenced_context_max_chars, unresolved=tuple(unresolved)
+        )
         self._emit_agent(pr, "context", "done", f"{len(snippets)}/{len(requests)} symbols")
         return block, [res.usage]
 
@@ -249,10 +264,10 @@ class ReviewOrchestrator:
         module hint's path, else code search; fetch at the head SHA; slice the definition.
         Every ``gh`` call is best-effort — a GhError just means the symbol is unresolved."""
         text, path = None, None
-        hint_path = module_to_path(req.module_hint)
-        if hint_path:
+        for hint_path in module_path_candidates(req.module_hint):
             try:
                 text, path = self.gh.get_file_content(pr.repo, hint_path, pr.head_sha), hint_path
+                break
             except GhError:
                 text = None
         if text is None:
@@ -268,8 +283,11 @@ class ReviewOrchestrator:
                     text = None
         if not text or not path:
             return None
-        body = extract_definition(text, req.symbol)
-        return ReferencedSnippet(symbol=req.symbol, path=path, text=body) if body else None
+        got = extract_symbol_snippet(text, req.symbol)
+        if not got:
+            return None
+        body, kind = got
+        return ReferencedSnippet(symbol=req.symbol, path=path, text=body, kind=kind)
 
     def rereview_if_mentioned(self, pr: PullRequest, just_reviewed: bool = False) -> ReviewOutcome | None:
         """Fire a full re-review when a new comment @mentions the bot.

@@ -51,27 +51,55 @@ def parse_context_requests(raw: str) -> list[ContextRequest]:
 
 
 # -- symbol resolution helpers ----------------------------------------------
-def module_to_path(hint: str) -> str | None:
-    """Best-effort map of a planner ``module_hint`` to a repo file path.
+# Extensions tried for a path-like hint with no extension of its own. JS-ish first:
+# the dotted-module branch already covers Python layouts.
+_EXT_TRY = (".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".rb")
 
-    Handles a dotted Python module (``a.b.c`` -> ``a/b/c.py``), an explicit path
-    (passed through), and ``from x.y import Z`` / ``import x.y`` statements. Returns
-    ``None`` for a bare symbol with no locating information — the caller then falls
+
+def module_path_candidates(hint: str) -> list[str]:
+    """Best-effort map of a planner ``module_hint`` to candidate repo file paths,
+    most likely first. The caller tries each with a (cheap, best-effort) fetch.
+
+    Handles a dotted Python module (``a.b.c`` -> ``a/b/c.py`` + package init), an
+    explicit path (passed through), ``from x.y import Z`` / ``import x.y``
+    statements, and JS/TS specifiers (``./utils/x``, ``@/lib/auth``) by fanning out
+    over common extensions + index files. Returns ``[]`` for a bare symbol or a
+    parent-relative path (no anchor to resolve against) — the caller then falls
     back to code search."""
     h = (hint or "").strip()
-    if not h:
-        return None
     if h.startswith("from ") and " import " in h:
         h = h[len("from "):h.index(" import ")].strip()
     elif h.startswith("import "):
         h = h[len("import "):].split(" as ")[0].split(",")[0].strip()
-    if not h:
-        return None
-    if "/" in h or h.endswith(_CODE_EXT):
-        return h
-    if "." in h:
-        return h.replace(".", "/") + ".py"
-    return None
+    h = h.strip("\"'")
+    if not h or "../" in h:
+        return []
+    if h.endswith(_CODE_EXT):
+        return [h]
+    if h.startswith("./"):
+        bases = [h[2:]]
+    elif h.startswith("@/"):
+        bases = ["src/" + h[2:], h[2:]]  # "@/" conventionally aliases the source root
+    elif "/" in h:
+        bases = [h]
+    elif "." in h:
+        b = h.replace(".", "/")
+        return [b + ".py", b + "/__init__.py"]
+    else:
+        return []
+    out: list[str] = []
+    for b in bases:
+        out.extend(b + ext for ext in _EXT_TRY)
+        out.extend((b + "/index.ts", b + "/index.js"))
+    return out[:12]
+
+
+def module_to_path(hint: str) -> str | None:
+    """The single most likely path for a ``module_hint`` (first candidate), or
+    ``None`` when unresolvable. Kept for compatibility; resolution should prefer
+    ``module_path_candidates``."""
+    cands = module_path_candidates(hint)
+    return cands[0] if cands else None
 
 
 def _cap(s: str, max_chars: int) -> str:
@@ -93,28 +121,75 @@ def _slice_block(lines: list[str], start: int, indent_len: int) -> str:
     return "\n".join(lines[start:end])
 
 
-def extract_definition(file_text: str, symbol: str, *, max_chars: int = 2000) -> str | None:
-    """Slice the definition of ``symbol`` out of a fetched file.
+def _slice_braces(lines: list[str], start: int) -> str | None:
+    """From ``start``, take lines until the block's braces balance — but only when
+    the header line itself (or an Allman-style next line) opens the brace. Returns
+    ``None`` otherwise, so a brace deep inside a Python body never hijacks the
+    indent-based slice."""
+    if "{" in lines[start]:
+        open_at = start
+    elif start + 1 < len(lines) and lines[start + 1].lstrip().startswith("{"):
+        open_at = start + 1
+    else:
+        return None
+    depth = 0
+    for j in range(start, len(lines)):
+        for ch in lines[j]:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+        if j >= open_at and depth <= 0:
+            return "\n".join(lines[start : j + 1])
+    return "\n".join(lines[start:])  # unbalanced (truncated file) — take the rest
 
-    Recognises ``def``/``class`` and module-level ``symbol =``/``symbol:`` blocks via
-    indentation. Falls back to a small window around the first mention. Returns
-    ``None`` if the symbol never appears. Result is capped to ``max_chars``."""
+
+def _definition_patterns(symbol: str) -> tuple[re.Pattern, ...]:
+    """Definition-line shapes across the languages the watched repos actually use
+    (Python, JS/TS, Go, Ruby) — not just Python."""
+    s = re.escape(symbol)
+    return tuple(re.compile(p) for p in (
+        rf"^(\s*)(?:async\s+def|def|class)\s+{s}\b",                                   # Python / Ruby
+        rf"^(\s*)(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(?:class|interface|enum)\s+{s}\b",
+        rf"^(\s*)(?:export\s+)?type\s+{s}\b",                                          # TS alias / Go type
+        rf"^(\s*)(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*{s}\s*\(",  # JS/TS function
+        rf"^(\s*)func\s+(?:\([^)]*\)\s+)?{s}\s*\(",                                    # Go func / method
+        rf"^(\s*)(?:export\s+)?(?:const|let|var)\s+{s}\s*[:=]",                        # JS/TS binding
+        rf"^(\s*)(?:(?:public|private|protected|static|async|override|readonly)\s+)*{s}\s*\([^)]*\)\s*(?::[^={{}}]*)?\{{",  # class-body method
+        rf"^(\s*){s}\s*[:=]",                                                          # module-level assignment
+    ))
+
+
+def extract_symbol_snippet(file_text: str, symbol: str, *, max_chars: int = 2000) -> tuple[str, str] | None:
+    """Slice a snippet for ``symbol`` out of a fetched file, reporting how good it is.
+
+    Returns ``(text, kind)`` where kind is "definition" (a recognized definition
+    line — block sliced by braces or indentation) or "usage" (only a mention window
+    was found; NOT a verified definition). Returns ``None`` if the symbol never
+    appears. Result is capped to ``max_chars``."""
     lines = file_text.splitlines()
-    esc = re.escape(symbol)
-    defpat = re.compile(rf"^(\s*)(?:async\s+def|def|class)\s+{esc}\b")
-    asgpat = re.compile(rf"^(\s*){esc}\s*[:=]")
-    for pat in (defpat, asgpat):
+    for pat in _definition_patterns(symbol):
         for i, ln in enumerate(lines):
             m = pat.match(ln)
             if m:
-                return _cap(_slice_block(lines, i, len(m.group(1))), max_chars)
-    # Fallback: first bare mention → a small context window.
+                block = _slice_braces(lines, i)
+                if block is None:
+                    block = _slice_block(lines, i, len(m.group(1)))
+                return _cap(block, max_chars), "definition"
+    # Fallback: first bare mention → a small context window. Usage only — the
+    # renderer must not present this as ground truth.
     for i, ln in enumerate(lines):
         if symbol in ln:
             lo = max(0, i - 3)
             hi = min(len(lines), i + 12)
-            return _cap("\n".join(lines[lo:hi]), max_chars)
+            return _cap("\n".join(lines[lo:hi]), max_chars), "usage"
     return None
+
+
+def extract_definition(file_text: str, symbol: str, *, max_chars: int = 2000) -> str | None:
+    """Snippet text only (see ``extract_symbol_snippet``); ``None`` when absent."""
+    got = extract_symbol_snippet(file_text, symbol, max_chars=max_chars)
+    return got[0] if got else None
 
 
 # -- render -----------------------------------------------------------------
@@ -125,20 +200,27 @@ _HEADER = (
     "truth; do not assume behavior beyond what they reveal.\n"
 )
 
+_USAGE_CAVEAT = " (nearby usage only — NOT a verified definition; do not treat as ground truth)"
 
-def render_referenced_context(snippets, *, max_chars: int) -> str:
-    """Render resolved snippets into one capped, newest-first-irrelevant block.
+
+def render_referenced_context(snippets, *, max_chars: int, unresolved=()) -> str:
+    """Render resolved snippets into one capped block.
 
     ``max_chars`` budgets the rendered snippet entries (not the fixed header). The
     first snippet is always kept; later ones are dropped once the budget is spent and
-    an omitted-count note is appended. Returns ``""`` when empty or disabled."""
-    if not snippets or max_chars <= 0:
+    an omitted-count note is appended. A "usage"-kind snippet is explicitly labelled
+    as NOT a verified definition so it can never pose as ground truth. ``unresolved``
+    names symbols whose lookup failed entirely — they are listed so the scorer's
+    cap-at-25 rule has something concrete to fire on. Returns ``""`` when there is
+    nothing to say or the feature is disabled."""
+    if max_chars <= 0 or (not snippets and not unresolved):
         return ""
     kept: list[str] = []
     used = 0
     omitted = 0
     for s in snippets:
-        entry = f"### {s.symbol} — {s.path}\n```\n{s.text.strip()}\n```"
+        caveat = _USAGE_CAVEAT if s.kind == "usage" else ""
+        entry = f"### {s.symbol} — {s.path}{caveat}\n```\n{s.text.strip()}\n```"
         if kept and used + len(entry) > max_chars:
             omitted += 1
             continue
@@ -149,5 +231,11 @@ def render_referenced_context(snippets, *, max_chars: int) -> str:
         parts.append(
             f"\n({omitted} more definition{'s' if omitted != 1 else ''} "
             "omitted to fit the context budget)"
+        )
+    if unresolved:
+        parts.append(
+            "\nUNRESOLVED (definition lookup failed — treat these symbols as unknown; "
+            "cap confidence at 25 for any finding that depends on their behavior): "
+            + ", ".join(unresolved)
         )
     return "\n".join(parts).strip() + "\n"

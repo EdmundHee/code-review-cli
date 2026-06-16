@@ -117,3 +117,43 @@ def test_scoring_prompt_caps_confidence_on_unverifiable_symbols():
     low = SCORING_SYSTEM_PROMPT.lower()
     assert "referenced definitions" in low
     assert "cap confidence at 25" in low
+
+
+# -- token cuts + posted-comment language boundary ----------------------------
+TWO_FILE_DIFF = """\
+diff --git a/a.py b/a.py
+@@ -1 +1 @@
+-aaa
++AAA-HUNK
+diff --git a/b.py b/b.py
+@@ -1 +1 @@
+-bbb
++BBB-HUNK
+"""
+
+
+def test_scoring_user_prompt_sends_only_finding_file_hunks():
+    fd = FilteredDiff(text=TWO_FILE_DIFF, kept_paths=["a.py", "b.py"], skipped_paths=[],
+                      changed_lines=4, kept_bytes=len(TWO_FILE_DIFF))
+    f = Finding(severity="WARNING", file="b.py", area="g", issue="bug", fix="x", lens="correctness")
+    out = build_scoring_user_prompt(make_pr(), fd, f)
+    assert "BBB-HUNK" in out and "AAA-HUNK" not in out
+
+
+def test_scoring_user_prompt_falls_back_to_full_diff_when_file_absent():
+    fd = FilteredDiff(text=TWO_FILE_DIFF, kept_paths=["a.py", "b.py"], skipped_paths=[],
+                      changed_lines=4, kept_bytes=len(TWO_FILE_DIFF))
+    f = Finding(severity="WARNING", file="missing.py", area="g", issue="bug", fix="x", lens="correctness")
+    out = build_scoring_user_prompt(make_pr(), fd, f)
+    assert "AAA-HUNK" in out and "BBB-HUNK" in out
+
+
+def test_scoring_prompt_instructs_refutation_first():
+    assert "refute" in SCORING_SYSTEM_PROMPT.lower()
+
+
+def test_every_lens_requires_full_sentence_issue_and_fix():
+    # internal prompts are compressed, but issue/fix land verbatim in the posted
+    # comment — every lens must demand human-readable full sentences for them
+    for name in LENS_NAMES:
+        assert "full sentences" in LENS_PROMPTS[name].lower()

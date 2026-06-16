@@ -1,5 +1,7 @@
 from ghcr.context_request import (
     extract_definition,
+    extract_symbol_snippet,
+    module_path_candidates,
     module_to_path,
     parse_context_requests,
     render_referenced_context,
@@ -59,6 +61,34 @@ def test_module_to_path_none_for_unresolvable():
     assert module_to_path("BareSymbol") is None  # no dot, no slash -> let search handle it
 
 
+# -- module_path_candidates ---------------------------------------------------
+def test_candidates_dotted_module_is_python_layout():
+    out = module_path_candidates("db.base")
+    assert out[0] == "db/base.py"
+    assert "db/base/__init__.py" in out
+
+
+def test_candidates_js_relative_path_fans_out_extensions():
+    out = module_path_candidates("./utils/helpers")
+    assert "utils/helpers.ts" in out and "utils/helpers.js" in out
+    assert "utils/helpers/index.ts" in out
+
+
+def test_candidates_alias_tries_src_prefix():
+    out = module_path_candidates("@/lib/auth")
+    assert "src/lib/auth.ts" in out and "lib/auth.ts" in out
+
+
+def test_candidates_explicit_path_passes_through():
+    assert module_path_candidates("pkg/mod.py") == ["pkg/mod.py"]
+
+
+def test_candidates_empty_for_bare_symbol_and_parent_relative():
+    assert module_path_candidates("BareSymbol") == []
+    assert module_path_candidates("../sibling/mod") == []
+    assert module_path_candidates("") == []
+
+
 # -- extract_definition -----------------------------------------------------
 def test_extract_class_block_stops_at_dedent():
     text = (
@@ -106,6 +136,88 @@ def test_extract_caps_length():
     assert len(out) <= 51 and out.endswith("…")
 
 
+# -- extract_symbol_snippet (kind-aware, language-aware) ----------------------
+def test_snippet_python_def_is_definition_kind():
+    text, kind = extract_symbol_snippet("def foo():\n    return 1\n", "foo")
+    assert kind == "definition" and "return 1" in text
+
+
+def test_snippet_bare_mention_is_usage_kind():
+    text, kind = extract_symbol_snippet("x = apply(SOMETHING, 2)\n", "SOMETHING")
+    assert kind == "usage" and "apply(SOMETHING" in text
+
+
+def test_snippet_js_function_slices_brace_block():
+    src = (
+        "export function helper(a) {\n"
+        "  if (a) {\n"
+        "    return 1;\n"
+        "  }\n"
+        "  return 2;\n"
+        "}\n"
+        "const bar = 1;\n"
+    )
+    text, kind = extract_symbol_snippet(src, "helper")
+    assert kind == "definition"
+    assert "return 2;" in text and "bar" not in text
+
+
+def test_snippet_js_const_arrow_is_definition():
+    src = "const foo = (a) => a + 1;\nconst bar = 2;\n"
+    text, kind = extract_symbol_snippet(src, "foo")
+    assert kind == "definition" and "a + 1" in text and "bar" not in text
+
+
+def test_snippet_go_method_receiver():
+    src = (
+        "func (s *Server) Handle(w http.ResponseWriter) {\n"
+        "\ts.mu.Lock()\n"
+        "}\n"
+        "\n"
+        "func other() {}\n"
+    )
+    text, kind = extract_symbol_snippet(src, "Handle")
+    assert kind == "definition" and "s.mu.Lock()" in text and "other" not in text
+
+
+def test_snippet_ts_interface():
+    src = "export interface Props {\n  id: string;\n}\nlet x = 1;\n"
+    text, kind = extract_symbol_snippet(src, "Props")
+    assert kind == "definition" and "id: string;" in text and "x = 1" not in text
+
+
+def test_snippet_class_body_method_shorthand():
+    src = (
+        "class A {\n"
+        "  async handle(req) {\n"
+        "    return req.id;\n"
+        "  }\n"
+        "  other() {}\n"
+        "}\n"
+    )
+    text, kind = extract_symbol_snippet(src, "handle")
+    assert kind == "definition" and "return req.id;" in text and "other" not in text
+
+
+def test_snippet_python_class_with_dict_keeps_whole_body():
+    # a brace inside the body must not trigger brace-slicing on a Python class
+    src = (
+        "class Foo:\n"
+        "    MAP = {\n"
+        "        'a': 1,\n"
+        "    }\n"
+        "    def bar(self):\n"
+        "        return 2\n"
+        "TOP = 1\n"
+    )
+    text, kind = extract_symbol_snippet(src, "Foo")
+    assert kind == "definition" and "def bar" in text and "TOP = 1" not in text
+
+
+def test_snippet_absent_returns_none():
+    assert extract_symbol_snippet("a = 1\n", "Nope") is None
+
+
 # -- render_referenced_context ----------------------------------------------
 def _snip(symbol="BaseConnector", path="db/base.py", text="class BaseConnector:\n    pass"):
     return ReferencedSnippet(symbol=symbol, path=path, text=text)
@@ -130,3 +242,25 @@ def test_render_caps_to_budget_and_notes_omitted():
     assert "a.py" in out          # first kept
     assert "B" * 400 not in out   # second dropped to fit
     assert "omitted" in out.lower()
+
+
+def test_render_marks_usage_snippets_as_unverified():
+    s = ReferencedSnippet(symbol="foo", path="a.js", text="x = foo(1)", kind="usage")
+    out = render_referenced_context([s], max_chars=6000)
+    assert "NOT a verified definition" in out
+
+
+def test_render_definition_snippets_carry_no_unverified_caveat():
+    out = render_referenced_context([_snip()], max_chars=6000)
+    assert "NOT a verified definition" not in out
+
+
+def test_render_lists_unresolved_symbols_with_cap_instruction():
+    out = render_referenced_context([], max_chars=6000, unresolved=("Alpha", "Beta"))
+    assert "REFERENCED DEFINITIONS" in out
+    assert "UNRESOLVED" in out and "Alpha" in out and "Beta" in out
+    assert "cap confidence" in out.lower()
+
+
+def test_render_empty_without_unresolved_stays_blank():
+    assert render_referenced_context([], max_chars=6000, unresolved=()) == ""

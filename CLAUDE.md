@@ -11,8 +11,10 @@ The package is split into **pure modules** (no I/O, no SDK, trivially testable) 
 - **Pure:** `models.py` (frozen dataclasses + `merge_usages`), `prompts.py` (prompt strings),
   `pipeline.py` (JSON parsing, dedup, test-file classification, markdown synthesis),
   `prior_context.py` (parse PR comments, render context block, `find_mention_triggers`),
-  `context_request.py` (parse the planner pass, `module_to_path`, `extract_definition`,
-  render the referenced-definitions block), `diff_filter.py`, `cost.py`, `comment.py`.
+  `context_request.py` (parse the planner pass, `module_path_candidates`,
+  `extract_symbol_snippet` — language-aware, kind-tagged "definition"/"usage" —
+  render the referenced-definitions block incl. the UNRESOLVED list),
+  `diff_filter.py` (incl. `file_hunks`), `cost.py`, `comment.py`.
 - **I/O:** `review.py` (`ReviewOrchestrator` — the composition root), `deepseek.py`
   (OpenAI-compatible client), `github.py` (`gh` CLI wrapper), `state.py` (SQLite),
   `poller.py`/`watcher.py`/`tui.py`/`cli.py`/`wizard.py`.
@@ -44,13 +46,16 @@ rides the existing scoring pass). Off via `review.read_prior_comments`; sized by
 unseen code (a called method, a base class, a field's meaning) and fire confident false BLOCKERs.
 To fix the root cause, multi optionally fetches the real source: after `classify_test_signal` and
 **after the budget gate** (it is spend), `_fetch_referenced_context` runs a **planner** call
-(`CONTEXT_REQUEST_PROMPT`, header `## PASS: context`) that lists the unseen symbols it needs;
-`_resolve_symbol` resolves each hybrid — `context_request.module_to_path` on the planner's
-`module_hint` first, else `gh search_code` — fetches it at the PR head SHA (`gh get_file_content`,
-raw blob), and `extract_definition` slices the def. The rendered "REFERENCED DEFINITIONS" block is
-injected into every lens + scoring prompt as authoritative ground truth. The lens severity rubric
-and a scoring **confidence cap at 25 for symbols still unresolved** are the safety net when
-resolution fails. On by default (`review.fetch_referenced_context`); sized by
+(`CONTEXT_REQUEST_PROMPT`, header `## PASS: context`, **thinking disabled** — listing symbols
+needs no reasoning spend) that lists the unseen symbols it needs; `_resolve_symbol` resolves each
+hybrid — `context_request.module_path_candidates` on the planner's `module_hint` first (tries
+Python AND JS/TS/Go/Ruby layouts), else `gh search_code` — fetches it at the PR head SHA
+(`gh get_file_content`, raw blob), and `extract_symbol_snippet` slices the def **and tags its
+kind**: a recognized definition renders as authoritative; a bare-mention fallback window renders
+with a "NOT a verified definition" caveat so it can never pose as ground truth. Symbols whose
+lookup failed entirely are rendered in an **UNRESOLVED list** — that is what makes the scoring
+**confidence cap at 25 for unresolved symbols** mechanically triggerable instead of hoping the
+model notices the gap. On by default (`review.fetch_referenced_context`); sized by
 `referenced_max_symbols` / `referenced_context_max_chars` / `referenced_search_limit`. The planner's
 usage is aggregated into the review cost. This is the one place multi relaxes diff-only.
 
@@ -62,7 +67,11 @@ usage is aggregated into the review cost. This is the one place multi relaxes di
      `test_coverage`) as parallel calls; each returns structured JSON findings.
   2. **Dedup** findings (`pipeline.dedup_findings`, Jaccard on issue text per file).
   3. **Score** every finding with `scoring_votes` independent calls (median); keep
-     `confidence >= confidence_threshold`.
+     `confidence >= confidence_threshold`. The scorer is told to try to REFUTE the finding
+     first (it is the same model that raised it — agreement isn't verification). Each scoring
+     call sends only the finding's **file hunks** (`diff_filter.file_hunks`), not the whole
+     diff — the full diff re-sent per finding×vote was the dominant token cost; falls back to
+     the full diff when the finding's path isn't in it.
   4. **Synthesize** markdown in Python (not a model call) with an explicit **Test coverage**
      verdict from the `test_coverage` lens.
   Cost scales ~(1 planner + lenses + findings×votes)× a single review — that trade is intentional.
@@ -92,6 +101,11 @@ usage is aggregated into the review cost. This is the one place multi relaxes di
   any failure degrades to an empty block and the review proceeds diff-only — a fetch must never
   block or fail a review. All planner + `gh` I/O runs on the **main thread** (before lens fan-out),
   never in a pool worker. `context_request` parsers skip junk, never raise.
+- **Prompt language boundary.** Internal system prompts are caveman-compressed (terse, no
+  filler) to cut input tokens — but finding `issue`/`fix` and the coverage `detail` are posted
+  verbatim to humans, so every lens prompt must keep demanding clear full sentences for those
+  fields. Keep the unique routing headers (`## LENS: <name>`, `## PASS: scoring`, `## PASS:
+  context`) verbatim — the test fake routes on them.
 - **Dataclasses are frozen.** Use `dataclasses.replace`, never mutate.
 - **Lazy `openai` import.** `deepseek.py` imports the SDK inside `__init__` so pure modules
   import without it. Keep it lazy.
