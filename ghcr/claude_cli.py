@@ -1,0 +1,86 @@
+"""Claude Code CLI client (`claude -p`), used as the multi-pass *advisor* provider.
+
+Subscription auth only works through the Claude CLI, so we shell out rather than
+hit the Anthropic API SDK (which would bill per-token credits). Mirrors
+``deepseek.py``: a pure ``build_claude_argv`` (unit-testable without subprocess)
+plus a thin client exposing the same ``review()`` interface as ``DeepSeekClient``.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+
+from .cost import Prices
+from .deepseek import DeepSeekError
+from .models import ReviewResult, Usage
+
+
+class ClaudeCliError(DeepSeekError):
+    """Subclass of DeepSeekError so the orchestrator's existing
+    ``except DeepSeekError`` best-effort paths catch CLI failures unchanged."""
+
+
+def build_claude_argv(claude_path: str, model: str, system_prompt: str) -> list[str]:
+    """Pure argv builder (no subprocess). User prompt is fed via stdin, NOT argv,
+    to avoid OS arg-length limits on large diffs."""
+    return [
+        claude_path, "-p",
+        "--system-prompt", system_prompt,
+        "--model", model,
+        "--output-format", "json",
+        "--disallowedTools", "*",  # pure text generator: no file reads / tool loops
+    ]
+
+
+class ClaudeCliClient:
+    def __init__(
+        self,
+        claude_path: str = "claude",
+        model: str = "opus",
+        timeout: int = 600,
+        prices: Prices | None = None,
+    ):
+        self.claude_path = claude_path
+        self.model = model
+        self.timeout = timeout
+        # 0/0 → subscription is flat; the orchestrator's cost split reads this.
+        self.prices = prices if prices is not None else Prices(0.0, 0.0)
+
+    def review(self, system_prompt: str, user_prompt: str, *, thinking: str | None = None) -> ReviewResult:
+        # `thinking` is accepted for interface parity with DeepSeekClient and
+        # intentionally ignored — the CLI has no equivalent toggle.
+        argv = build_claude_argv(self.claude_path, self.model, system_prompt)
+        try:
+            proc = subprocess.run(
+                argv, input=user_prompt, capture_output=True, text=True, timeout=self.timeout
+            )
+        except subprocess.TimeoutExpired as e:
+            raise ClaudeCliError(f"claude -p timed out after {self.timeout}s") from e
+        except OSError as e:  # binary missing / not executable
+            raise ClaudeCliError(f"claude -p failed to launch: {e}") from e
+
+        if proc.returncode != 0:
+            raise ClaudeCliError(
+                f"claude -p exited {proc.returncode}: {(proc.stderr or '').strip()[:500]}"
+            )
+        try:
+            data = json.loads(proc.stdout)
+        except (json.JSONDecodeError, TypeError) as e:
+            raise ClaudeCliError(
+                f"claude -p returned non-JSON output: {e}; "
+                f"stderr: {(proc.stderr or '').strip()[:200]}"
+            ) from e
+
+        if not isinstance(data, dict):
+            raise ClaudeCliError(f"claude -p returned non-object JSON: {type(data).__name__}")
+
+        content = (data.get("result") or "").strip()
+        if not content:
+            raise ClaudeCliError("claude -p returned empty result")
+
+        u = data.get("usage") or {}
+        in_tok = int(u.get("input_tokens", 0) or 0)
+        out_tok = int(u.get("output_tokens", 0) or 0)
+        usage = Usage(prompt_tokens=in_tok, completion_tokens=out_tok, total_tokens=in_tok + out_tok)
+        return ReviewResult(content=content, usage=usage, model=self.model)
