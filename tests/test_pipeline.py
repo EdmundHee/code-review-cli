@@ -3,6 +3,7 @@ from ghcr.models import CoverageVerdict, Finding
 from ghcr.pipeline import (
     classify_test_signal,
     dedup_findings,
+    merge_coverage,
     parse_lens_payload,
     parse_score,
     synthesize_markdown,
@@ -132,3 +133,39 @@ def test_synthesize_no_dropped_keeps_plain_clean_message():
     # No scored_total passed (e.g. zero findings ever) → original wording.
     md = synthesize_markdown([], None)
     assert "No high-confidence issues found" in md
+
+
+def test_synthesize_notes_unreviewed_files():
+    md = synthesize_markdown([], None, unreviewed_files=["big/a.py", "big/b.py"])
+    assert "## Notes" in md
+    assert "big/a.py, big/b.py" in md and "max_review_chunks" in md
+
+
+def test_synthesize_notes_combine_lens_errors_and_unreviewed():
+    md = synthesize_markdown([], None, lens_errors=["security"], unreviewed_files=["x.py"])
+    assert md.count("## Notes") == 1
+    assert "security" in md and "x.py" in md
+
+
+# -- merge_coverage -----------------------------------------------------------
+def test_merge_coverage_any_failing_chunk_wins():
+    v = merge_coverage([
+        CoverageVerdict(has_tests=True, detail="chunk 1 fine"),
+        CoverageVerdict(has_tests=False, detail="new fn foo untested"),
+    ])
+    assert v.has_tests is False
+    assert v.detail == "new fn foo untested"  # detail from the failing verdict
+
+
+def test_merge_coverage_all_pass_keeps_first_nonempty_detail():
+    v = merge_coverage([
+        None,
+        CoverageVerdict(has_tests=True, detail=""),
+        CoverageVerdict(has_tests=True, detail="tests added"),
+    ])
+    assert v.has_tests is True and v.detail == "tests added"
+
+
+def test_merge_coverage_all_none_is_none():
+    assert merge_coverage([]) is None
+    assert merge_coverage([None, None]) is None

@@ -253,6 +253,7 @@ def build_scoring_user_prompt(
 def build_user_prompt(
     pr: PullRequest, fd: FilteredDiff, truncated: bool = False,
     prior_context: str = "", referenced_context: str = "",
+    chunk_index: int = 0, chunk_total: int = 1,
 ) -> str:
     skipped = ", ".join(fd.skipped_paths) if fd.skipped_paths else "none"
     header = (
@@ -266,6 +267,11 @@ def build_user_prompt(
     )
     if truncated:
         header += "NOTE: the diff was truncated due to size; review only what is shown.\n"
+    if chunk_total > 1:
+        header += (
+            f"NOTE: this is part {chunk_index}/{chunk_total} of this PR's diff, split by whole "
+            "files; other parts (which may contain the tests) are reviewed separately.\n"
+        )
     return (
         f"{header}{_referenced_block(referenced_context)}{_prior_block(prior_context)}"
         f"\nUnified diff:\n```diff\n{fd.text}\n```\n"

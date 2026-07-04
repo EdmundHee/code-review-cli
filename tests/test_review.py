@@ -114,6 +114,27 @@ def test_oversized_byte_cap_posts_notice(tmp_path):
     assert store.already_reviewed("owner/repo", 1, "a" * 40)
 
 
+def test_byte_cap_measured_post_filter_lockfile_junk_ignored(tmp_path):
+    # A PR that is mostly lockfile churn plus a little real code must be reviewed:
+    # the cap applies to what SURVIVES filtering, not the raw diff.
+    lock_lines = "".join(f"+lockjunk {i}\n" for i in range(200))
+    big_lock = (
+        "diff --git a/poetry.lock b/poetry.lock\n"
+        "index a..b 100644\n"
+        "--- a/poetry.lock\n"
+        "+++ b/poetry.lock\n"
+        "@@ -0,0 +200 @@\n"
+        f"{lock_lines}"
+    )
+    gh = FakeGhClient(diff=big_lock + SRC_DIFF)
+    ds = FakeDeepSeekClient()
+    orch, store = _orch(tmp_path, gh, ds, max_diff_bytes=1_000)  # raw >> cap, kept << cap
+    out = orch.review_pr(make_pr())
+    assert out.action == "review"
+    assert ds.calls == 1
+    assert store.recent(1)[0]["outcome"] == "reviewed"
+
+
 def test_oversized_token_cap(tmp_path):
     gh = FakeGhClient(diff=SRC_DIFF)
     ds = FakeDeepSeekClient()

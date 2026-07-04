@@ -75,6 +75,17 @@ def test_scoring_prompt_instructs_suppression_of_already_raised():
     assert "already raised" in SCORING_SYSTEM_PROMPT.lower()
 
 
+# -- chunked-review note ------------------------------------------------------
+def test_build_user_prompt_no_chunk_note_by_default():
+    assert "part " not in build_user_prompt(make_pr(), _fd())
+
+
+def test_build_user_prompt_chunk_note_when_chunked():
+    out = build_user_prompt(make_pr(), _fd(), chunk_index=2, chunk_total=3)
+    assert "part 2/3" in out and "reviewed separately" in out
+    assert "THE DIFF" in out
+
+
 # -- referenced-context injection + planner pass ----------------------------
 def test_build_user_prompt_omits_referenced_block_by_default():
     assert "REFERENCED DEFINITIONS" not in build_user_prompt(make_pr(), _fd())

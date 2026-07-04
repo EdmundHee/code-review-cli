@@ -60,6 +60,24 @@ def test_build_comment_omits_trigger_note_by_default():
     assert "Re-review requested" not in body
 
 
+def test_build_comment_chunk_footer():
+    body = build_comment(
+        content="x", pr=PR, model="m", timestamp="t",
+        kept_files=9, skipped_files=[], changed_lines=100,
+        chunks=3, truncated_files=["big/huge.py"],
+    )
+    assert "reviewed in 3 chunks" in body
+    assert "truncated to fit: big/huge.py" in body
+
+
+def test_build_comment_no_chunk_footer_by_default():
+    body = build_comment(
+        content="x", pr=PR, model="m", timestamp="t",
+        kept_files=1, skipped_files=[], changed_lines=1,
+    )
+    assert "chunks" not in body and "truncated" not in body
+
+
 def test_notice_comment_has_marker():
     body = build_notice_comment(
         kind="oversized", pr=PR, model="m", timestamp="t", detail="too big"

@@ -41,9 +41,15 @@ def build_comment(
     changed_lines: int,
     truncated: bool = False,
     trigger_note: str = "",
+    chunks: int = 1,
+    truncated_files=(),
 ) -> str:
     short = pr.head_sha[:7]
     trunc = " · diff truncated" if truncated else ""
+    if chunks > 1:
+        trunc += f" · reviewed in {chunks} chunks"
+    if truncated_files:
+        trunc += f" · truncated to fit: {', '.join(truncated_files)}"
     note = f"_{trigger_note}_\n\n" if trigger_note else ""
     return (
         f"{marker(pr.head_sha, model)}\n"

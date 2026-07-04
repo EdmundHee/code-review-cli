@@ -34,9 +34,12 @@ review_policy:
   # bot_login is always added to this set automatically.
 
 diff:
-  max_diff_bytes: 400000              # raw-read + post-filter cap
+  max_diff_bytes: 400000              # POST-FILTER size cap: target review-chunk size (multi) / skip threshold (single)
   per_run_input_token_cap: 250000     # context-size gate (chars/4); in multi it caps the SUM over lenses
   oversized_behavior: notice          # notice | skip
+  chunk_reviews: true                 # multi: split an over-cap filtered diff into whole-file chunks and review ALL of it
+  hard_max_diff_bytes: 5000000        # raw pre-filter sanity ceiling (OOM guard); beyond this the PR is still skipped
+  max_review_chunks: 10               # cost guard: chunks past this are not reviewed, listed in the comment instead
   # test_globs: paths the test_coverage lens treats as tests (omit to use built-in defaults)
   skip_globs:
     - "**/*.lock"

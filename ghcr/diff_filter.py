@@ -124,6 +124,122 @@ def count_changed_lines(diff: str) -> int:
     return added + removed
 
 
+@dataclass(frozen=True)
+class DiffChunk:
+    """One whole-file slice of a filtered diff, sized to fit a review call."""
+
+    text: str
+    paths: tuple[str, ...]
+    byte_size: int
+    truncated_paths: tuple[str, ...] = ()  # files whose hunks were cut to fit
+
+
+def _truncation_marker(path: str) -> str:
+    # Plain bracketed line (no backticks, no +/- prefix) so it can never break
+    # the ```diff fence it is embedded in, nor count as a changed line.
+    return f"[ghcr: remaining hunks of {path} omitted - diff for this file exceeds the review chunk size]\n"
+
+
+def _truncate_file_diff(text: str, max_bytes: int, path: str) -> str:
+    """Cut one file's diff to ``max_bytes`` at the last fitting hunk (@@) boundary,
+    falling back to a line boundary when even the first hunk overflows. Appends an
+    explicit marker line so the cut is never silent."""
+    marker = _truncation_marker(path)
+    budget = max(0, max_bytes - len(marker.encode("utf-8")))
+    kept: list[str] = []
+    size = 0
+    hunk_starts: list[int] = []  # indices in ``kept`` where a hunk begins
+    for ln in text.splitlines(keepends=True):
+        if ln.startswith("@@"):
+            hunk_starts.append(len(kept))
+        n = len(ln.encode("utf-8"))
+        if size + n > budget:
+            break
+        kept.append(ln)
+        size += n
+    else:
+        return text  # everything fit (caller shouldn't hit this, but be safe)
+    # Drop a partially-included trailing hunk so we never end mid-hunk — unless
+    # that would drop the ONLY hunk, in which case a line-boundary cut is better
+    # than reviewing nothing of the file.
+    if hunk_starts and hunk_starts[-1] < len(kept) and len(hunk_starts) > 1:
+        kept = kept[: hunk_starts[-1]]
+    return "".join(kept) + marker
+
+
+def _group_by_top_dir(files: list[FileDiff]) -> list[FileDiff]:
+    """Stably order files so same-top-level-directory files are adjacent (groups in
+    order of first appearance, original order within a group) — related code and
+    its tests tend to land in the same chunk."""
+    order: list[str] = []
+    groups: dict[str, list[FileDiff]] = {}
+    for f in files:
+        key = f.path.split("/", 1)[0] if "/" in f.path else "."
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(f)
+    return [f for key in order for f in groups[key]]
+
+
+def chunk_filtered_diff(text: str, max_bytes: int) -> list[DiffChunk]:
+    """Split a filtered unified diff into chunks of whole files, each <= ``max_bytes``.
+
+    Greedy fill over files grouped by top-level directory. A single file bigger
+    than ``max_bytes`` becomes its own chunk, truncated at a hunk boundary with an
+    explicit marker (path recorded in ``truncated_paths``) — so every chunk is
+    guaranteed under the budget and no cut is silent. ``"" -> []``.
+    """
+    files = split_into_file_diffs(text)
+    if not files:
+        return []
+    chunks: list[DiffChunk] = []
+    cur: list[FileDiff] = []
+    cur_size = 0
+
+    def flush():
+        nonlocal cur, cur_size
+        if cur:
+            chunks.append(DiffChunk(
+                text="".join(f.text for f in cur),
+                paths=tuple(f.path for f in cur),
+                byte_size=cur_size,
+            ))
+            cur, cur_size = [], 0
+
+    for f in _group_by_top_dir(files):
+        fsize = len(f.text.encode("utf-8"))
+        if fsize > max_bytes:
+            flush()
+            cut = _truncate_file_diff(f.text, max_bytes, f.path)
+            chunks.append(DiffChunk(
+                text=cut,
+                paths=(f.path,),
+                byte_size=len(cut.encode("utf-8")),
+                truncated_paths=(f.path,),
+            ))
+            continue
+        if cur_size + fsize > max_bytes:
+            flush()
+        cur.append(f)
+        cur_size += fsize
+    flush()
+    return chunks
+
+
+def chunk_view(fd: FilteredDiff, chunk: DiffChunk) -> FilteredDiff:
+    """A ``FilteredDiff`` presenting one chunk, so the existing prompt builders and
+    lens plumbing work per-chunk unchanged. ``skipped_paths`` is preserved (shown
+    once per chunk header)."""
+    return FilteredDiff(
+        text=chunk.text,
+        kept_paths=list(chunk.paths),
+        skipped_paths=fd.skipped_paths,
+        changed_lines=count_changed_lines(chunk.text),
+        kept_bytes=chunk.byte_size,
+    )
+
+
 def filter_diff(diff: str, skip_globs) -> FilteredDiff:
     kept_texts: list[str] = []
     kept_paths: list[str] = []

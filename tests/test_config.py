@@ -73,6 +73,43 @@ def test_bad_behavior_rejected(tmp_path):
         load_config(_write(tmp_path, bad), env={}, resolve_secrets=False)
 
 
+def test_chunking_defaults(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID), env={}, resolve_secrets=False)
+    assert cfg.diff.chunk_reviews is True
+    assert cfg.diff.hard_max_diff_bytes == 5_000_000
+    assert cfg.diff.max_review_chunks == 10
+
+
+def test_chunking_parsed(tmp_path):
+    text = VALID.replace(
+        "diff:\n  oversized_behavior: notice",
+        "diff:\n  oversized_behavior: notice\n  chunk_reviews: false\n"
+        "  hard_max_diff_bytes: 900000\n  max_review_chunks: 3",
+    )
+    cfg = load_config(_write(tmp_path, text), env={}, resolve_secrets=False)
+    assert cfg.diff.chunk_reviews is False
+    assert cfg.diff.hard_max_diff_bytes == 900_000
+    assert cfg.diff.max_review_chunks == 3
+
+
+def test_hard_ceiling_below_cap_rejected(tmp_path):
+    text = VALID.replace(
+        "diff:\n  oversized_behavior: notice",
+        "diff:\n  oversized_behavior: notice\n  hard_max_diff_bytes: 100",
+    )
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, text), env={}, resolve_secrets=False)
+
+
+def test_zero_review_chunks_rejected(tmp_path):
+    text = VALID.replace(
+        "diff:\n  oversized_behavior: notice",
+        "diff:\n  oversized_behavior: notice\n  max_review_chunks: 0",
+    )
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, text), env={}, resolve_secrets=False)
+
+
 # -- review section ----------------------------------------------------------
 
 def test_review_defaults_to_multi(tmp_path):

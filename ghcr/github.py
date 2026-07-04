@@ -100,9 +100,10 @@ class GhClient:
         return _pr_from_json(repo, json.loads(out))
 
     def get_pr_diff(self, repo: str, number: int) -> str:
-        # NOTE: gh buffers the full diff into stdout. max_diff_bytes is enforced
-        # by the caller on the returned string; for v1 that is an acceptable
-        # OOM risk for pathological (tens-of-MB) generated-file PRs.
+        # NOTE: gh buffers the full diff into stdout. The caller bounds memory via
+        # diff.hard_max_diff_bytes on the returned string (review-size caps are
+        # applied later, post-filter); a diff bigger than the ceiling still costs
+        # one full buffering — an accepted risk.
         return self._run(["--repo", repo, "pr", "diff", str(number), "--patch"])
 
     def search_code(self, repo: str, query: str, limit: int = 5) -> list[dict]:

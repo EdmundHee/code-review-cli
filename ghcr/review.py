@@ -16,10 +16,10 @@ from datetime import datetime, timedelta, timezone
 
 from . import comment as comment_mod
 from .config import Config
-from .cost import estimate_cost_usd, estimate_input_tokens
+from .cost import estimate_cost_usd, estimate_input_tokens, per_chunk_diff_budget
 from .deepseek import DeepSeekError
 from .events import AgentEvent, DeepSeekDone
-from .diff_filter import filter_diff
+from .diff_filter import DiffChunk, chunk_filtered_diff, chunk_view, filter_diff
 from .github import GhError
 from .models import (
     ACTION_ERROR,
@@ -48,6 +48,7 @@ from .context_request import (
 from .pipeline import (
     classify_test_signal,
     dedup_findings,
+    merge_coverage,
     parse_lens_payload,
     parse_score,
     synthesize_markdown,
@@ -118,9 +119,13 @@ class ReviewOrchestrator:
         record_outcome = ACTION_REREVIEWED if trigger == "mention" else "reviewed"
 
         raw = self.gh.get_pr_diff(pr.repo, pr.number)
-        if len(raw.encode("utf-8")) > self.cfg.diff.max_diff_bytes:
+        # Sanity ceiling on the RAW diff (pathological PRs; gh buffers the whole
+        # diff into memory). The real review-size cap is measured post-filter on
+        # kept_bytes — junk the filter strips must not disqualify a PR.
+        if len(raw.encode("utf-8")) > self.cfg.diff.hard_max_diff_bytes:
             return self._handle_oversized(
-                pr, ts, f"Raw diff exceeds {self.cfg.diff.max_diff_bytes:,} bytes."
+                pr, ts,
+                f"Raw diff exceeds the {self.cfg.diff.hard_max_diff_bytes:,}-byte hard ceiling.",
             )
 
         fd = filter_diff(raw, list(self.cfg.diff.skip_globs))
@@ -128,6 +133,14 @@ class ReviewOrchestrator:
             if not dry_run:
                 self.store.record(pr.repo, pr.number, pr.head_sha, ACTION_SKIP_EMPTY, model=model)
             return ReviewOutcome(ACTION_SKIP_EMPTY)
+
+        # Multi mode with chunking on reviews any post-filter size (split into
+        # chunks inside _review_multi); everything else keeps the hard cap.
+        chunkable = self.cfg.review.mode == "multi" and self.cfg.diff.chunk_reviews
+        if not chunkable and fd.kept_bytes > self.cfg.diff.max_diff_bytes:
+            return self._handle_oversized(
+                pr, ts, f"Filtered diff exceeds {self.cfg.diff.max_diff_bytes:,} bytes."
+            )
 
         # Existing PR conversation as context (best-effort; failure → empty block).
         # A mention re-review passes the comments it already fetched, to avoid a re-fetch.
@@ -221,7 +234,7 @@ class ReviewOrchestrator:
             return None
         return list(issue) + list(review)
 
-    def _fetch_referenced_context(self, pr: PullRequest, fd) -> tuple[str, list[Usage]]:
+    def _fetch_referenced_context(self, pr: PullRequest, fd, agent_suffix: str = "") -> tuple[str, list[Usage]]:
         """Resolve the definitions of symbols the diff references but does not define.
 
         A planner model call lists the symbols; each is resolved to repo source (hint or
@@ -231,10 +244,11 @@ class ReviewOrchestrator:
         rc = self.cfg.review
         if not rc.fetch_referenced_context:
             return "", []
+        agent = f"context{agent_suffix}"
         # Announce the planner as a sub-agent so the TUI shows "reviewing #N" from
         # the moment it starts — this is the one slow pre-lens step, and without a
         # signal the row sits on bare "polling…" for its whole (~minute) duration.
-        self._emit_agent(pr, "context", "running")
+        self._emit_agent(pr, agent, "running")
         try:
             # thinking disabled: listing symbols needs no deep reasoning, and the
             # reasoning tokens bill as output — the planner is pure overhead there.
@@ -243,7 +257,7 @@ class ReviewOrchestrator:
             )
         except DeepSeekError as e:
             log.warning("context planner failed repo=%s pr=%s: %s", pr.repo, pr.number, e)
-            self._emit_agent(pr, "context", "failed", "planner api error")
+            self._emit_agent(pr, agent, "failed", "planner api error")
             return "", []
         requests = parse_context_requests(res.content)[: rc.referenced_max_symbols]
         snippets: list[ReferencedSnippet] = []
@@ -259,7 +273,7 @@ class ReviewOrchestrator:
         block = render_referenced_context(
             snippets, max_chars=rc.referenced_context_max_chars, unresolved=tuple(unresolved)
         )
-        self._emit_agent(pr, "context", "done", f"{len(snippets)}/{len(requests)} symbols")
+        self._emit_agent(pr, agent, "done", f"{len(snippets)}/{len(requests)} symbols")
         return block, [res.usage]
 
     def _resolve_symbol(self, pr: PullRequest, req) -> ReferencedSnippet | None:
@@ -330,16 +344,38 @@ class ReviewOrchestrator:
         confidence, then synthesize + post. All model calls run in a thread pool;
         store/bus writes happen only here on the main thread."""
         rc = self.cfg.review
+        dc = self.cfg.diff
         lenses = list(rc.lenses)
 
-        # Context-size gate: the diff is re-sent to every lens, so estimate the sum.
-        est = sum(estimate_input_tokens(LENS_PROMPTS[ln] + user_prompt) for ln in lenses)
-        if est > self.cfg.diff.per_run_input_token_cap:
-            return self._handle_oversized(
-                pr, ts,
-                f"Estimated multi-pass input ~{est:,} tokens across {len(lenses)} lenses "
-                f"exceeds the {self.cfg.diff.per_run_input_token_cap:,} token cap.",
+        # Decide chunking BEFORE any spend. A chunk must satisfy the byte cap AND
+        # the per-run token sum gate below — chunking at max_diff_bytes alone would
+        # still trip the token gate (it binds first; see per_chunk_diff_budget).
+        chunks: list[DiffChunk] = []
+        if dc.chunk_reviews:
+            chunk_budget = per_chunk_diff_budget(
+                dc.max_diff_bytes, dc.per_run_input_token_cap, len(lenses),
+                self._lens_overhead_tokens(pr, fd, lenses, prior_ctx),
             )
+            if chunk_budget <= 0:
+                return self._handle_oversized(
+                    pr, ts,
+                    f"per_run_input_token_cap ({dc.per_run_input_token_cap:,}) is too small "
+                    "for the review prompts alone; cannot size a review chunk.",
+                )
+            if fd.kept_bytes > chunk_budget:
+                chunks = chunk_filtered_diff(fd.text, chunk_budget)
+
+        if not chunks:
+            # Context-size gate: the diff is re-sent to every lens, so estimate the sum.
+            # Chunked reviews skip it — every chunk fits by construction, and a mid-loop
+            # _handle_oversized would write a terminal row after money was spent.
+            est = sum(estimate_input_tokens(LENS_PROMPTS[ln] + user_prompt) for ln in lenses)
+            if est > dc.per_run_input_token_cap:
+                return self._handle_oversized(
+                    pr, ts,
+                    f"Estimated multi-pass input ~{est:,} tokens across {len(lenses)} lenses "
+                    f"exceeds the {dc.per_run_input_token_cap:,} token cap.",
+                )
 
         if not dry_run:
             cutoff = self._now() - timedelta(hours=24)
@@ -348,27 +384,77 @@ class ReviewOrchestrator:
 
         # Spend money.
         t0 = time.monotonic()
-        has_source, has_test = classify_test_signal(fd, self.cfg.diff.test_globs)
+        # Whole-PR signal even when chunked: the hint must say "this PR ships tests"
+        # even if the tests sit in a different chunk than the source.
+        has_source, has_test = classify_test_signal(fd, dc.test_globs)
 
-        # Fetch the real definitions of symbols the diff references but does not show,
-        # so the lenses + scorer judge against ground truth instead of guessing. Best-
-        # effort and gated by config; on any failure the review proceeds diff-only.
-        ref_ctx, ref_usages = self._fetch_referenced_context(pr, fd)
-        if ref_ctx:
-            user_prompt = build_user_prompt(pr, fd, prior_context=prior_ctx, referenced_context=ref_ctx)
+        to_review = chunks[: dc.max_review_chunks]
+        unreviewed_files = [p for ch in chunks[dc.max_review_chunks:] for p in ch.paths]
+        truncated_files = [p for ch in to_review for p in ch.truncated_paths]
 
-        lens_results: list[LensResult] = self._map_parallel(
-            lenses, lambda ln: self._run_one_lens(ln, pr, fd, user_prompt, has_source, has_test)
-        )
+        worker_usages: list[Usage] = []
+        advisor_usages: list[Usage] = []
+        lens_errors: list[str] = []
+        coverages: list = []
+        raw_findings: list = []
+        total_calls = failed_calls = 0
+        # Scoring context per finding: its file's chunk text + that chunk's referenced
+        # definitions, so the scoring fallback is bounded by ONE chunk, never the full text.
+        score_ctx: dict[str, tuple[str, str]] = {}
+        default_ctx = (fd.text, "")
 
-        worker_usages: list[Usage] = [lr.usage for lr in lens_results]
-        advisor_usages: list[Usage] = list(ref_usages)
-        lens_errors = [lr.lens for lr in lens_results if not lr.ok]
-        coverage = next((lr.coverage for lr in lens_results if lr.coverage is not None), None)
-        raw_findings = [f for lr in lens_results if lr.ok for f in lr.findings]
+        if not chunks:
+            # Fetch the real definitions of symbols the diff references but does not show,
+            # so the lenses + scorer judge against ground truth instead of guessing. Best-
+            # effort and gated by config; on any failure the review proceeds diff-only.
+            ref_ctx, ref_usages = self._fetch_referenced_context(pr, fd)
+            if ref_ctx:
+                user_prompt = build_user_prompt(pr, fd, prior_context=prior_ctx, referenced_context=ref_ctx)
 
-        # Every lens failed → record error (cost still counted), do not post.
-        if len(lens_errors) == len(lenses):
+            lens_results: list[LensResult] = self._map_parallel(
+                lenses, lambda ln: self._run_one_lens(ln, pr, fd, user_prompt, has_source, has_test)
+            )
+            worker_usages = [lr.usage for lr in lens_results]
+            advisor_usages = list(ref_usages)
+            lens_errors = [lr.lens for lr in lens_results if not lr.ok]
+            coverages = [lr.coverage for lr in lens_results]
+            raw_findings = [f for lr in lens_results if lr.ok for f in lr.findings]
+            total_calls, failed_calls = len(lenses), len(lens_errors)
+            default_ctx = (fd.text, ref_ctx)
+        else:
+            # Sequential chunk loop on the main thread; only the lens fan-out is pooled.
+            # No size gate inside the loop — every chunk fits the caps by construction.
+            n = len(to_review)
+            log.info("chunked review repo=%s pr=%s: %d chunks (%d bytes filtered)",
+                     pr.repo, pr.number, len(chunks), fd.kept_bytes)
+            for i, ch in enumerate(to_review, start=1):
+                cfd = chunk_view(fd, ch)
+                ref_ctx, ref_usages = self._fetch_referenced_context(pr, cfd, agent_suffix=f"·c{i}")
+                up = build_user_prompt(pr, cfd, prior_context=prior_ctx, referenced_context=ref_ctx,
+                                       chunk_index=i, chunk_total=n)
+                lens_results = self._map_parallel(
+                    lenses,
+                    lambda ln, cfd=cfd, up=up, i=i: self._run_one_lens(
+                        ln, pr, cfd, up, has_source, has_test, agent_suffix=f"·c{i}"
+                    ),
+                )
+                worker_usages += [lr.usage for lr in lens_results]
+                advisor_usages += list(ref_usages)
+                errs = [f"{lr.lens} (part {i}/{n})" for lr in lens_results if not lr.ok]
+                lens_errors += errs
+                coverages += [lr.coverage for lr in lens_results]
+                raw_findings += [f for lr in lens_results if lr.ok for f in lr.findings]
+                total_calls += len(lenses)
+                failed_calls += len(errs)
+                for p in ch.paths:
+                    score_ctx[p] = (ch.text, ref_ctx)
+                if i == 1:
+                    default_ctx = (ch.text, ref_ctx)  # bounded fallback for hallucinated paths
+
+        coverage = merge_coverage(coverages)
+
+        # Every call failed → record error (cost still counted), do not post.
+        if failed_calls == total_calls:
             worker_u, advisor_u = self._provider_usage(worker_usages, advisor_usages)
             cost = self._split_cost(worker_usages, advisor_usages)
             if not dry_run:
@@ -383,10 +469,16 @@ class ReviewOrchestrator:
         findings = [replace(f, id=i) for i, f in enumerate(dedup_findings(raw_findings))]
 
         # Score each finding (parallel); keep only high-confidence survivors.
+        # Each finding is scored against ITS chunk's text + referenced definitions
+        # (unchunked: the whole filtered diff — identical to the old behavior).
         survivors: list = []
         scored_total = 0
         if findings:
-            scored = self._map_parallel(findings, lambda f: self._score_finding(f, pr, fd, rc.scoring_votes, prior_ctx, ref_ctx))
+            def _score(f):
+                ctext, rctx = score_ctx.get(f.file.strip(), default_ctx)
+                return self._score_finding(f, pr, replace(fd, text=ctext), rc.scoring_votes, prior_ctx, rctx)
+
+            scored = self._map_parallel(findings, _score)
             for f, conf, reason, score_usages in scored:
                 advisor_usages.extend(score_usages)
                 if conf is None:
@@ -402,6 +494,7 @@ class ReviewOrchestrator:
         content = synthesize_markdown(
             survivors, coverage, lens_errors=lens_errors,
             scored_total=scored_total, threshold=rc.confidence_threshold,
+            unreviewed_files=unreviewed_files,
         )
 
         if self.bus:
@@ -416,6 +509,7 @@ class ReviewOrchestrator:
             content=content, pr=pr, model=model, timestamp=ts,
             kept_files=len(fd.kept_paths), skipped_files=fd.skipped_paths, changed_lines=fd.changed_lines,
             trigger_note=trigger_note,
+            chunks=len(to_review) if chunks else 1, truncated_files=truncated_files,
         )
 
         if dry_run:
@@ -452,6 +546,18 @@ class ReviewOrchestrator:
             + estimate_cost_usd(merge_usages(advisor_usages), self.advisor_prices)
         )
 
+    def _lens_overhead_tokens(self, pr, fd, lenses, prior_ctx: str) -> int:
+        """Everything a lens call sends EXCEPT the diff itself: the lens system
+        prompts plus, per lens, the diff-less user prompt (headers + prior
+        discussion) and a reserve for the per-chunk referenced-context block.
+        Pure string math (no spend) — feeds per_chunk_diff_budget."""
+        base_up = build_user_prompt(pr, replace(fd, text=""), prior_context=prior_ctx)
+        reserve = self.cfg.review.referenced_context_max_chars // 4
+        return (
+            sum(estimate_input_tokens(LENS_PROMPTS[ln]) for ln in lenses)
+            + len(lenses) * (estimate_input_tokens(base_up) + reserve)
+        )
+
     def _map_parallel(self, items, fn):
         """Run ``fn`` over ``items`` concurrently, preserving order. Workers must
         only call the model + pure helpers — never touch the store or bus."""
@@ -469,7 +575,7 @@ class ReviewOrchestrator:
         if self.bus:
             model = (
                 self.advisor.model
-                if (agent.startswith("score") or agent == "context")
+                if (agent.startswith("score") or agent.startswith("context"))
                 else self.deepseek.model
             )
             self.bus.publish(AgentEvent(
@@ -477,8 +583,11 @@ class ReviewOrchestrator:
                 detail=detail, title=pr.title, model=model,
             ))
 
-    def _run_one_lens(self, lens: str, pr, fd, user_prompt: str, has_source: bool, has_test: bool) -> LensResult:
-        agent = f"lens:{lens}"
+    def _run_one_lens(self, lens: str, pr, fd, user_prompt: str, has_source: bool, has_test: bool,
+                      agent_suffix: str = "") -> LensResult:
+        # agent_suffix distinguishes per-chunk runs on the TUI agents board
+        # (keyed by name — unsuffixed chunk runs would overwrite each other).
+        agent = f"lens:{lens}{agent_suffix}"
         self._emit_agent(pr, agent, "running")
         up = user_prompt + coverage_hint(has_source, has_test) if lens == "test_coverage" else user_prompt
         t0 = time.monotonic()

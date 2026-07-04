@@ -24,7 +24,26 @@ Keep new pure logic in a pure module so it stays unit-testable without network o
 ## Review pipeline
 
 `review.mode` (config) selects the path; both share the prefix
-`decide() → fetch diff → byte cap → filter_diff → empty check → fetch prior PR comments`.
+`decide() → fetch diff → hard raw ceiling (diff.hard_max_diff_bytes, OOM guard) → filter_diff →
+empty check → post-filter size cap → fetch prior PR comments`. The size cap measures
+`FilteredDiff.kept_bytes` (what survives filtering), NOT raw bytes — lockfile/generated junk the
+filter strips must never disqualify a PR. In single mode (or `diff.chunk_reviews: false`) an
+over-cap filtered diff still skips (`skip_oversized`); in multi it is **chunked** (below).
+
+**Chunked review (multi only).** A filtered diff over the per-chunk budget is split by
+`diff_filter.chunk_filtered_diff` into chunks of whole files (grouped by top-level dir; a single
+file over the budget is truncated at a hunk boundary with an explicit marker + comment-footer note)
+and the lens fan-out runs per chunk — sequentially on the main thread, only the fan-out pooled.
+Findings accumulate across chunks into ONE dedup → scoring → synthesize → post → record →
+`DeepSeekDone` tail; coverage verdicts merge via `pipeline.merge_coverage` (any-False wins);
+outcome is plain `reviewed`. **Chunk sizing must satisfy the token cap, not just the byte cap**
+(`cost.per_chunk_diff_budget` = min of both; the token sum-gate binds first at defaults — chunking
+at `max_diff_bytes` alone would still skip) and all guards (`budget <= 0`, budget gate) run
+PRE-spend: `_handle_oversized` writes a terminal row and must never fire mid-loop after chunk 1
+spent money. Each finding is scored against ITS chunk's text/ref-ctx so the scoring full-diff
+fallback stays bounded by one chunk. Overflow past `diff.max_review_chunks` reviews the first N
+chunks and lists the unreviewed files in the comment (never a silent gap). Knobs (all
+hot-reloadable): `diff.chunk_reviews` (default on) / `hard_max_diff_bytes` / `max_review_chunks`.
 
 **Two triggers.** (1) **Head SHA** — the poller reviews each PR once per unique head SHA
 (`decide()` → `already_reviewed`). (2) **@mention** — after `review_pr`, the poller calls

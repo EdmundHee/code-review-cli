@@ -97,6 +97,9 @@ class DiffConfig:
     skip_globs: tuple[str, ...]
     oversized_behavior: str  # "notice" | "skip"
     test_globs: tuple[str, ...] = tuple(_DEFAULT_TEST_GLOBS)
+    chunk_reviews: bool = True  # multi: split an over-cap filtered diff instead of skipping
+    hard_max_diff_bytes: int = 5_000_000  # raw pre-filter sanity ceiling; still skip_oversized
+    max_review_chunks: int = 10  # budget guard; overflow chunks listed as unreviewed
 
 
 @dataclass(frozen=True)
@@ -298,7 +301,14 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
         skip_globs=tuple(str(g) for g in skip_globs),
         oversized_behavior=_behavior(diff.get("oversized_behavior", "notice"), "diff.oversized_behavior"),
         test_globs=tuple(str(g) for g in test_globs),
+        chunk_reviews=bool(diff.get("chunk_reviews", True)),
+        hard_max_diff_bytes=int(diff.get("hard_max_diff_bytes", 5_000_000)),
+        max_review_chunks=int(diff.get("max_review_chunks", 10)),
     )
+    if diff_cfg.hard_max_diff_bytes < diff_cfg.max_diff_bytes:
+        raise ConfigError("diff.hard_max_diff_bytes must be >= diff.max_diff_bytes")
+    if diff_cfg.max_review_chunks < 1:
+        raise ConfigError("diff.max_review_chunks must be >= 1")
     budget_cfg = BudgetConfig(
         daily_usd_budget=float(budgets.get("daily_usd_budget", 5.0)),
         budget_exceeded_behavior=_behavior(

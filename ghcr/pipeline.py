@@ -173,8 +173,24 @@ def classify_test_signal(fd, test_globs) -> tuple[bool, bool]:
     return has_source, has_test
 
 
+def merge_coverage(verdicts) -> CoverageVerdict | None:
+    """Combine per-chunk coverage verdicts into one PR-level verdict.
+
+    Any chunk reporting untested behavior wins (``has_tests = all(...)``); the
+    detail comes from the first failing verdict, else the first non-empty one.
+    ``None`` entries (chunks whose coverage lens failed) are dropped; all-None
+    → ``None`` (rendered as "Not assessed")."""
+    got = [v for v in verdicts if v is not None]
+    if not got:
+        return None
+    failing = next((v for v in got if not v.has_tests), None)
+    detail = failing.detail if failing else next((v.detail for v in got if v.detail), "")
+    return CoverageVerdict(has_tests=failing is None, detail=detail)
+
+
 # -- synthesis --------------------------------------------------------------
-def synthesize_markdown(findings, coverage, *, lens_errors=(), scored_total=0, threshold=None) -> str:
+def synthesize_markdown(findings, coverage, *, lens_errors=(), scored_total=0, threshold=None,
+                        unreviewed_files=()) -> str:
     """Render surviving findings + the coverage verdict into the comment body
     (same shape the old single-pass SYSTEM_PROMPT produced).
 
@@ -216,8 +232,16 @@ def synthesize_markdown(findings, coverage, *, lens_errors=(), scored_total=0, t
                 conf = f" _(confidence {f.confidence})_" if f.confidence is not None else ""
                 lines.append(f"- **[{sev}]** {loc} — {f.issue}{fix}{conf}")
 
+    notes: list[str] = []
     if lens_errors:
+        notes.append(f"Review lenses that failed and were skipped: {', '.join(lens_errors)}.")
+    if unreviewed_files:
+        notes.append(
+            f"Not reviewed (review chunk cap reached): {', '.join(unreviewed_files)} — "
+            "raise diff.max_review_chunks to cover them."
+        )
+    if notes:
         lines.append("\n## Notes")
-        lines.append(f"Review lenses that failed and were skipped: {', '.join(lens_errors)}.")
+        lines.extend(notes)
 
     return "\n".join(lines).strip() + "\n"
