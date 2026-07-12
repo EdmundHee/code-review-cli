@@ -139,11 +139,14 @@ class DashboardState:
         # TUI start). wp/wc = worker (DeepSeek), ap/ac = advisor (Claude).
         self.tok24_wp = self.tok24_wc = self.tok24_ap = self.tok24_ac = 0
         self.sess_wp = self.sess_wc = self.sess_ap = self.sess_ac = 0
-        self.advisor_model = (
-            cfg.claude.model
-            if cfg.review.advisor_provider == "claude" and cfg.claude is not None
-            else cfg.deepseek.model
-        )
+        # Advisor model label for the header/token line. Claude runs via the CLI
+        # (cfg.claude); any OpenAI-compatible advisor (e.g. GLM) via cfg.advisor.
+        if cfg.review.advisor_provider == "claude" and cfg.claude is not None:
+            self.advisor_model = cfg.claude.model
+        elif cfg.review.advisor_provider == "openai" and cfg.advisor is not None:
+            self.advisor_model = cfg.advisor.model
+        else:
+            self.advisor_model = cfg.deepseek.model
         # Live sub-agents (lenses + scorers) for the PR currently under review.
         self.agents_pr: tuple | None = None
         self.agents: dict[str, dict] = {}
@@ -211,7 +214,7 @@ def reduce(state: DashboardState, evt: object) -> None:
         state.sess_wc += evt.completion_tokens
         state.sess_ap += evt.advisor_prompt_tokens
         state.sess_ac += evt.advisor_completion_tokens
-        adv = f" · opus {evt.advisor_prompt_tokens}→{evt.advisor_completion_tokens}" if evt.advisor_prompt_tokens else ""
+        adv = f" · {state.advisor_model} {evt.advisor_prompt_tokens}→{evt.advisor_completion_tokens}" if evt.advisor_prompt_tokens else ""
         state.events.append(
             f"{_hhmmss(_utcnow())} deepseek {evt.repo}#{evt.pr_number} "
             f"{evt.prompt_tokens}→{evt.completion_tokens} tok{adv} ({evt.latency_s:.1f}s)"
@@ -257,7 +260,7 @@ def _header(state: DashboardState) -> Panel:
     models = f"{state.model} + {state.advisor_model}" if hybrid else state.model
     tok = f"ds {_fmt_tok(state.tok24_wp)}↑/{_fmt_tok(state.tok24_wc)}↓"
     if hybrid:
-        tok += f" · opus {_fmt_tok(state.tok24_ap)}↑/{_fmt_tok(state.tok24_ac)}↓"
+        tok += f" · {state.advisor_model} {_fmt_tok(state.tok24_ap)}↑/{_fmt_tok(state.tok24_ac)}↓"
     text = Text.assemble(
         ("ghcr", "bold cyan"), " · ",
         (state.bot_login, "bold"), " · ",

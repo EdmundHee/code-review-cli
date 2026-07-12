@@ -20,3 +20,14 @@ def test_thinking_disabled_has_no_reasoning_effort():
     assert kw["extra_body"] == {"thinking": {"type": "disabled"}}
     for k in _FORBIDDEN:
         assert k not in kw
+
+
+def test_send_thinking_extra_body_false_drops_thinking():
+    # GLM / generic OpenAI-compatible advisor: no DeepSeek-specific extra_body.
+    kw = build_request_kwargs(
+        "glm-5.2", "disabled", "high", "sys", "user", send_thinking_extra_body=False
+    )
+    assert "extra_body" not in kw
+    assert "reasoning_effort" not in kw
+    assert set(kw) == {"model", "messages"}
+    assert kw["model"] == "glm-5.2"

@@ -84,6 +84,19 @@ class ClaudeConfig:
 
 
 @dataclass(frozen=True)
+class AdvisorConfig:
+    """Generic OpenAI-compatible advisor (e.g. GLM-5.2 via a Z.ai subscription).
+    Drives a second ``DeepSeekClient`` pointed at ``base_url``; ``send_thinking_extra_body``
+    defaults False so the DeepSeek-specific ``thinking`` extra_body isn't sent."""
+    api_key: str
+    base_url: str
+    model: str
+    request_timeout_seconds: int
+    prices: Prices  # default 0/0 → subscription is flat, report $0
+    send_thinking_extra_body: bool = False
+
+
+@dataclass(frozen=True)
 class ReviewPolicy:
     skip_drafts: bool
     review_backlog_on_start: bool
@@ -116,7 +129,7 @@ class ReviewModeConfig:
     referenced_max_symbols: int = 6  # cap on symbols resolved per review
     referenced_context_max_chars: int = 6000  # budget for the rendered referenced-defs block
     referenced_search_limit: int = 5  # code-search results scanned per unresolved symbol
-    advisor_provider: str = "deepseek"  # "deepseek" | "claude" (planner+scoring on Opus)
+    advisor_provider: str = "deepseek"  # "deepseek" | "claude" (Opus CLI) | "openai" (GLM etc.)
 
 
 @dataclass(frozen=True)
@@ -138,6 +151,7 @@ class Config:
     db_path: str
     log_level: str
     claude: "ClaudeConfig | None" = None
+    advisor: "AdvisorConfig | None" = None
 
 
 # Fields safe to swap into a running loop (read fresh every cycle/PR). The rest
@@ -148,7 +162,7 @@ class Config:
 # CLIENT is constructed at startup (cli._build) — flipping deepseek<->claude
 # requires a restart to take effect.
 _RELOADABLE = ("repos", "poll_interval_seconds", "review_policy", "diff", "budgets", "review")
-_RESTART_ONLY = ("github", "deepseek", "db_path", "log_level", "claude")
+_RESTART_ONLY = ("github", "deepseek", "db_path", "log_level", "claude", "advisor")
 
 
 def merge_reloadable(old: Config, new: Config) -> tuple[Config, list[str]]:
@@ -199,9 +213,9 @@ def _parse_review(review: dict) -> "ReviewModeConfig":
         raise ConfigError("review.max_parallel must be >= 0 (0 = unbounded)")
 
     advisor_provider = review.get("advisor_provider", "deepseek")
-    if advisor_provider not in ("deepseek", "claude"):
+    if advisor_provider not in ("deepseek", "claude", "openai"):
         raise ConfigError(
-            f"review.advisor_provider must be 'deepseek' or 'claude', got {advisor_provider!r}"
+            f"review.advisor_provider must be 'deepseek', 'claude' or 'openai', got {advisor_provider!r}"
         )
 
     return ReviewModeConfig(
@@ -218,6 +232,28 @@ def _parse_review(review: dict) -> "ReviewModeConfig":
         referenced_context_max_chars=max(0, int(review.get("referenced_context_max_chars", 6000))),
         referenced_search_limit=max(1, int(review.get("referenced_search_limit", 5))),
         advisor_provider=advisor_provider,
+    )
+
+
+def _parse_advisor(advisor_raw: dict, env, resolve_secrets: bool) -> "AdvisorConfig":
+    """Generic OpenAI-compatible advisor block (used when advisor_provider == 'openai').
+    Key resolved from ``api_key_env`` — never a literal secret in YAML."""
+    aprices_raw = advisor_raw.get("prices", {}) or {}
+    api_key = (
+        _require_env(env, advisor_raw.get("api_key_env", "ADVISOR_API_KEY"), "advisor api key")
+        if resolve_secrets
+        else ""
+    )
+    return AdvisorConfig(
+        api_key=api_key,
+        base_url=advisor_raw.get("base_url", "https://api.z.ai/api/paas/v4"),
+        model=advisor_raw.get("model", "glm-5.2"),
+        request_timeout_seconds=int(advisor_raw.get("request_timeout_seconds", 600)),
+        prices=Prices(
+            input_per_1m=float(aprices_raw.get("input_per_1m", 0.0)),
+            output_per_1m=float(aprices_raw.get("output_per_1m", 0.0)),
+        ),
+        send_thinking_extra_body=bool(advisor_raw.get("send_thinking_extra_body", False)),
     )
 
 
@@ -243,6 +279,7 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
     logging_cfg = raw.get("logging", {}) or {}
 
     claude_raw = raw.get("claude", {}) or {}
+    advisor_raw = raw.get("advisor", {}) or {}
 
     repos = raw.get("repos") or []
     if not repos:
@@ -331,6 +368,10 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
             ),
         )
 
+    advisor_cfg = None
+    if review_cfg.advisor_provider == "openai":
+        advisor_cfg = _parse_advisor(advisor_raw, env, resolve_secrets)
+
     return Config(
         github=github_cfg,
         deepseek=deepseek_cfg,
@@ -343,4 +384,5 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
         db_path=os.path.expanduser(storage.get("db_path", "~/.local/state/ghcr/ghcr.db")),
         log_level=str(logging_cfg.get("level", "INFO")).upper(),
         claude=claude_cfg,
+        advisor=advisor_cfg,
     )

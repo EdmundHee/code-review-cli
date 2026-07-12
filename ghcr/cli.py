@@ -44,6 +44,17 @@ def _build(cfg: Config, bus=None):
             timeout=cfg.claude.request_timeout_seconds,
             prices=cfg.claude.prices,
         )
+    elif cfg.review.advisor_provider == "openai":
+        # Generic OpenAI-compatible advisor (e.g. GLM-5.2 via a Z.ai subscription).
+        # A distinct DeepSeekClient → its tokens/cost report separately (advisor is not ds).
+        advisor = DeepSeekClient(
+            api_key=cfg.advisor.api_key,
+            base_url=cfg.advisor.base_url,
+            model=cfg.advisor.model,
+            timeout=cfg.advisor.request_timeout_seconds,
+            send_thinking_extra_body=cfg.advisor.send_thinking_extra_body,
+        )
+        advisor.prices = cfg.advisor.prices  # _split_cost / advisor_prices read .prices
     store = StateStore(cfg.db_path)
     orch = ReviewOrchestrator(gh, ds, store, cfg, bus=bus, advisor=advisor)
     return gh, ds, store, orch

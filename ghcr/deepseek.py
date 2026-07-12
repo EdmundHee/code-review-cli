@@ -21,6 +21,7 @@ def build_request_kwargs(
     reasoning_effort: str,
     system_prompt: str,
     user_prompt: str,
+    send_thinking_extra_body: bool = True,
 ) -> dict:
     kwargs: dict = {
         "model": model,
@@ -29,6 +30,10 @@ def build_request_kwargs(
             {"role": "user", "content": user_prompt},
         ],
     }
+    if not send_thinking_extra_body:
+        # Generic OpenAI-compatible endpoint (e.g. GLM): the DeepSeek-specific
+        # `thinking` extra_body isn't understood — send a plain chat completion.
+        return kwargs
     if thinking == "enabled":
         # Sampling params are intentionally omitted — unsupported with thinking.
         kwargs["reasoning_effort"] = reasoning_effort
@@ -47,12 +52,14 @@ class DeepSeekClient:
         thinking: str = "enabled",
         reasoning_effort: str = "high",
         timeout: int = 600,
+        send_thinking_extra_body: bool = True,
     ):
         from openai import OpenAI  # lazy: keeps pure modules importable without the SDK
 
         self.model = model
         self.thinking = thinking
         self.reasoning_effort = reasoning_effort
+        self.send_thinking_extra_body = send_thinking_extra_body
         self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
 
     def review(self, system_prompt: str, user_prompt: str, *, thinking: str | None = None) -> ReviewResult:
@@ -60,7 +67,8 @@ class DeepSeekClient:
         this call only — the planner pass runs "disabled" (symbol listing needs no
         deep reasoning, and reasoning tokens bill as output)."""
         kwargs = build_request_kwargs(
-            self.model, thinking or self.thinking, self.reasoning_effort, system_prompt, user_prompt
+            self.model, thinking or self.thinking, self.reasoning_effort, system_prompt, user_prompt,
+            send_thinking_extra_body=self.send_thinking_extra_body,
         )
         try:
             resp = self._client.chat.completions.create(**kwargs)

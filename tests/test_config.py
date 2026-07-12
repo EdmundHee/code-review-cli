@@ -271,6 +271,35 @@ def test_advisor_provider_invalid_raises(tmp_path):
         load_config(_write(tmp_path, body), env={"GH_TOKEN": "x", "DS_KEY": "y"})
 
 
+def test_advisor_provider_openai_builds_advisor_config(tmp_path):
+    body = _ADVISOR_BASE + textwrap.dedent("""
+    review: {advisor_provider: openai}
+    advisor:
+      base_url: https://api.z.ai/api/paas/v4
+      model: glm-5.2
+      api_key_env: ZAI_KEY
+    """)
+    cfg = load_config(
+        _write(tmp_path, body), env={"GH_TOKEN": "x", "DS_KEY": "y", "ZAI_KEY": "z"}
+    )
+    assert cfg.review.advisor_provider == "openai"
+    assert cfg.advisor.base_url == "https://api.z.ai/api/paas/v4"
+    assert cfg.advisor.model == "glm-5.2"
+    assert cfg.advisor.api_key == "z"
+    assert cfg.advisor.send_thinking_extra_body is False  # default for generic openai
+    assert cfg.advisor.prices.input_per_1m == 0.0  # subscription flat → $0
+    assert cfg.claude is None
+
+
+def test_advisor_provider_openai_missing_key_fails_fast(tmp_path):
+    body = _ADVISOR_BASE + textwrap.dedent("""
+    review: {advisor_provider: openai}
+    advisor: {model: glm-5.2, api_key_env: ZAI_KEY}
+    """)
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, body), env={"GH_TOKEN": "x", "DS_KEY": "y"})
+
+
 def test_merge_reports_claude_change_as_restart_only(tmp_path):
     from ghcr.config import ClaudeConfig
     from ghcr.cost import Prices

@@ -285,6 +285,28 @@ def test_header_shows_both_models_and_opus_tokens_when_hybrid():
     assert "ds " in text                          # per-provider token line present
 
 
+def test_advisor_model_reads_cfg_advisor_for_openai_provider():
+    import dataclasses
+
+    from ghcr.config import AdvisorConfig
+    from ghcr.cost import Prices
+    from ghcr.tui import _header
+
+    advisor_cfg = AdvisorConfig(
+        api_key="z", base_url="https://api.z.ai/api/paas/v4", model="glm-5.2",
+        request_timeout_seconds=600, prices=Prices(0.0, 0.0),
+    )
+    cfg = dataclasses.replace(
+        make_config(db_path=":memory:", advisor_provider="openai"), advisor=advisor_cfg
+    )
+    st = DashboardState(cfg)
+    assert st.advisor_model == "glm-5.2"          # not the deepseek worker fallback
+    st.seed([], spent_24h=0.0, tokens_24h=ProviderTokens(1200, 400, 180, 95))
+    panel = _header(st)
+    text = panel.renderable.plain if hasattr(panel.renderable, "plain") else str(panel.renderable)
+    assert "glm-5.2" in text                       # advisor label, not hardcoded "opus"
+
+
 # -- rolling-24h re-query + calendar-day ("today") tests ----------------------
 
 from datetime import datetime, timedelta, timezone
