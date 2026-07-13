@@ -41,6 +41,7 @@ from .models import (
 )
 from .context_request import (
     extract_symbol_snippet,
+    is_test_like_path,
     module_path_candidates,
     parse_context_requests,
     render_referenced_context,
@@ -68,6 +69,13 @@ from .prompts import (
 _SEV_RANK = {s: i for i, s in enumerate(SEVERITY_ORDER)}
 
 log = logging.getLogger("ghcr.review")
+
+# One app-level retry for the planner call. The SDK's own low-level retries cover
+# brief blips; this covers a longer transient window (the incident that motivated it
+# was a single Connection error that silently dropped the review to diff-only). Runs
+# on the main thread pre-fan-out, so the sleep blocks the poller — kept modest, and in
+# the chunked path it is at worst max_review_chunks × this. Tests monkeypatch it to 0.
+PLANNER_RETRY_DELAY_S = 15.0
 
 
 @dataclass
@@ -249,16 +257,27 @@ class ReviewOrchestrator:
         # the moment it starts — this is the one slow pre-lens step, and without a
         # signal the row sits on bare "polling…" for its whole (~minute) duration.
         self._emit_agent(pr, agent, "running")
-        try:
-            # thinking disabled: listing symbols needs no deep reasoning, and the
-            # reasoning tokens bill as output — the planner is pure overhead there.
-            res = self.advisor.review(
-                CONTEXT_REQUEST_PROMPT, build_context_request_user_prompt(pr, fd), thinking="disabled"
-            )
-        except DeepSeekError as e:
-            log.warning("context planner failed repo=%s pr=%s: %s", pr.repo, pr.number, e)
-            self._emit_agent(pr, agent, "failed", "planner api error")
-            return "", []
+        res = None
+        for attempt in (1, 2):
+            try:
+                # thinking disabled: listing symbols needs no deep reasoning, and the
+                # reasoning tokens bill as output — the planner is pure overhead there.
+                res = self.advisor.review(
+                    CONTEXT_REQUEST_PROMPT, build_context_request_user_prompt(pr, fd), thinking="disabled"
+                )
+                break
+            except DeepSeekError as e:
+                if attempt == 1:
+                    log.warning(
+                        "context planner failed (attempt 1/2) repo=%s pr=%s: %s — retry in %ss",
+                        pr.repo, pr.number, e, PLANNER_RETRY_DELAY_S,
+                    )
+                    self._emit_agent(pr, agent, "running", "retrying after planner error")
+                    time.sleep(PLANNER_RETRY_DELAY_S)
+                    continue
+                log.warning("context planner failed repo=%s pr=%s: %s", pr.repo, pr.number, e)
+                self._emit_agent(pr, agent, "failed", "planner api error")
+                return "", []
         requests = parse_context_requests(res.content)[: rc.referenced_max_symbols]
         snippets: list[ReferencedSnippet] = []
         unresolved: list[str] = []
@@ -280,6 +299,8 @@ class ReviewOrchestrator:
         """Resolve one ContextRequest to a ReferencedSnippet, or None. Hybrid: try the
         module hint's path, else code search; fetch at the head SHA; slice the definition.
         Every ``gh`` call is best-effort — a GhError just means the symbol is unresolved."""
+        if getattr(req, "kind", "definition") == "tests":
+            return self._resolve_tests(pr, req)
         text, path = None, None
         for hint_path in module_path_candidates(req.module_hint):
             try:
@@ -305,6 +326,33 @@ class ReviewOrchestrator:
             return None
         body, kind = got
         return ReferencedSnippet(symbol=req.symbol, path=path, text=body, kind=kind)
+
+    def _resolve_tests(self, pr: PullRequest, req) -> ReferencedSnippet | None:
+        """Resolve a kind="tests" request to an EXISTING test excerpt, or None. Skips
+        the module hint (it points at the source, not its tests): code-search the symbol,
+        pick the first test-like path, fetch at the head SHA. Best-effort — any GhError or
+        no test-like hit means the symbol joins the UNRESOLVED list."""
+        try:
+            hits = self.gh.search_code(pr.repo, req.symbol, self.cfg.review.referenced_search_limit)
+        except GhError:
+            hits = []
+        path = next(
+            (h["path"] for h in hits
+             if isinstance(h, dict) and h.get("path") and is_test_like_path(h["path"])),
+            None,
+        )
+        if not path:
+            return None
+        try:
+            text = self.gh.get_file_content(pr.repo, path, pr.head_sha)
+        except GhError:
+            return None
+        got = extract_symbol_snippet(text, req.symbol)
+        if not got:
+            return None
+        # Force kind="test" regardless of whether the slice matched a def or a usage
+        # window — this is presented as a test excerpt, not a candidate definition.
+        return ReferencedSnippet(symbol=req.symbol, path=path, text=got[0], kind="test")
 
     def rereview_if_mentioned(self, pr: PullRequest, just_reviewed: bool = False) -> ReviewOutcome | None:
         """Fire a full re-review when a new comment @mentions the bot.
@@ -482,10 +530,27 @@ class ReviewOrchestrator:
             for f, conf, reason, score_usages in scored:
                 advisor_usages.extend(score_usages)
                 if conf is None:
+                    # Scoring failed entirely (not even a dropped-count entry) — an
+                    # anomaly worth surfacing, unlike a merely below-bar score.
+                    log.warning(
+                        "finding unscored repo=%s pr=%s lens=%s severity=%s file=%s issue=%s",
+                        pr.repo, pr.number, f.lens, f.severity, f.file,
+                        " ".join(f.issue.split())[:200],
+                    )
                     continue
                 scored_total += 1  # got a score → counts toward the dropped tally
                 if conf >= rc.confidence_threshold:
                     survivors.append(replace(f, confidence=conf, reason=reason))
+                else:
+                    # A dropped finding vanishes from the posted comment (only a count
+                    # survives) — log it so a "why was this missed?" postmortem is grep-able.
+                    log.info(
+                        "finding dropped repo=%s pr=%s lens=%s severity=%s file=%s "
+                        "confidence=%d threshold=%d reason=%s issue=%s",
+                        pr.repo, pr.number, f.lens, f.severity, f.file,
+                        conf, rc.confidence_threshold, " ".join(reason.split()),
+                        " ".join(f.issue.split())[:200],
+                    )
             survivors.sort(key=lambda f: (_SEV_RANK.get(f.severity, 9), f.id))
 
         latency_s = time.monotonic() - t0

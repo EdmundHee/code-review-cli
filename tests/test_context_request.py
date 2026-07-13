@@ -1,6 +1,7 @@
 from ghcr.context_request import (
     extract_definition,
     extract_symbol_snippet,
+    is_test_like_path,
     module_path_candidates,
     module_to_path,
     parse_context_requests,
@@ -38,6 +39,38 @@ def test_parse_unparseable_or_empty_returns_empty_list():
 def test_parse_never_raises_on_wrong_shape():
     assert parse_context_requests('{"requests": "not a list"}') == []
     assert parse_context_requests('[1,2,3]') == []
+
+
+def test_parse_kind_tests_accepted():
+    raw = '{"requests":[{"symbol":"DEFAULT_TIMEOUT","module_hint":"cfg","kind":"tests","reason":"changed"}]}'
+    out = parse_context_requests(raw)
+    assert out == [ContextRequest(symbol="DEFAULT_TIMEOUT", module_hint="cfg", reason="changed", kind="tests")]
+
+
+def test_parse_kind_singular_test_normalized_to_tests():
+    raw = '{"requests":[{"symbol":"X","kind":"TEST"}]}'
+    assert parse_context_requests(raw)[0].kind == "tests"
+
+
+def test_parse_junk_or_missing_kind_defaults_to_definition():
+    for raw in (
+        '{"requests":[{"symbol":"X"}]}',
+        '{"requests":[{"symbol":"X","kind":"banana"}]}',
+        '{"requests":[{"symbol":"X","kind":7}]}',
+    ):
+        assert parse_context_requests(raw)[0].kind == "definition"
+
+
+# -- is_test_like_path ------------------------------------------------------
+def test_is_test_like_path_variants():
+    for p in (
+        "tests/test_base.py", "backend/tests/agents/test_widget.py",
+        "src/__tests__/a.ts", "foo.spec.ts", "components/Button.test.tsx",
+        "pkg/x_test.go", "spec/models/user_spec.rb",
+    ):
+        assert is_test_like_path(p), p
+    for p in ("src/contest.py", "db/base.py", "widget_transform.py", "lib/latest.js"):
+        assert not is_test_like_path(p), p
 
 
 # -- module_to_path ---------------------------------------------------------
@@ -264,3 +297,16 @@ def test_render_lists_unresolved_symbols_with_cap_instruction():
 
 def test_render_empty_without_unresolved_stays_blank():
     assert render_referenced_context([], max_chars=6000, unresolved=()) == ""
+
+
+def test_render_test_kind_snippet_labeled_existing_test():
+    s = ReferencedSnippet(symbol="X", path="tests/test_x.py", text="def test_x():\n    assert X == 1", kind="test")
+    out = render_referenced_context([s], max_chars=6000)
+    assert "EXISTING TEST" in out
+    assert "tests/test_x.py" in out and "assert X == 1" in out
+
+
+def test_render_test_kind_carries_no_unverified_caveat():
+    s = ReferencedSnippet(symbol="X", path="tests/test_x.py", text="assert X == 1", kind="test")
+    out = render_referenced_context([s], max_chars=6000)
+    assert "NOT a verified definition" not in out

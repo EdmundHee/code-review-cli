@@ -105,7 +105,9 @@ def test_search_fallback_when_no_module_hint(tmp_path):
     assert any("class BaseConnector" in u for u in ds.user_for("## LENS: correctness"))
 
 
-def test_planner_failure_degrades_to_no_block(tmp_path):
+def test_planner_failure_degrades_to_no_block(tmp_path, monkeypatch):
+    monkeypatch.setattr("ghcr.review.PLANNER_RETRY_DELAY_S", 0)
+
     def fail_planner(system, user):
         raise DeepSeekError("planner down")
 
@@ -114,8 +116,29 @@ def test_planner_failure_degrades_to_no_block(tmp_path):
     orch, store = _orch(tmp_path, gh, ds)
     out = orch.review_pr(make_pr())
     assert out.action == "review"  # planner failure must not fail the review
+    assert ds.calls_matching("## PASS: context") == 2  # one retry before giving up
     assert all("REFERENCED DEFINITIONS" not in u for u in ds.user_for("## LENS: correctness"))
     assert gh.file_calls == 0  # nothing parsed -> no resolution attempted
+
+
+def test_planner_transient_failure_retries_once_then_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr("ghcr.review.PLANNER_RETRY_DELAY_S", 0)
+    state = {"n": 0}
+
+    def flaky_planner(system, user):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise DeepSeekError("transient")
+        return PLANNER
+
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"db/base.py": BASE_SRC})
+    ds = FakeDeepSeekClient(responses=_responses(planner=flaky_planner))
+    orch, store = _orch(tmp_path, gh, ds)
+    out = orch.review_pr(make_pr())
+    assert out.action == "review"
+    assert ds.calls_matching("## PASS: context") == 2  # failed once, retried, succeeded
+    lens_users = ds.user_for("## LENS: correctness")
+    assert lens_users and all("REFERENCED DEFINITIONS" in u for u in lens_users)
 
 
 def test_gh_failure_during_resolution_lists_symbol_unresolved(tmp_path):
@@ -151,6 +174,43 @@ def test_fetch_disabled_skips_planner_and_gh(tmp_path):
     assert all("REFERENCED DEFINITIONS" not in u for u in ds.user_for("## LENS: correctness"))
 
 
+TESTS_PLANNER = '{"requests":[{"symbol":"BaseConnector","module_hint":"db.base","kind":"tests","reason":"default changed"}]}'
+TEST_SRC = "def test_close_reconnects():\n    assert BaseConnector().close() is None\n"
+
+
+def test_kind_tests_resolved_via_search_prefers_test_path(tmp_path):
+    gh = FakeGhClient(
+        diff=SRC_DIFF,
+        search_results={"BaseConnector": [{"path": "src/base.py"}, {"path": "tests/test_base.py"}]},
+        file_contents={"tests/test_base.py": TEST_SRC},
+    )
+    ds = FakeDeepSeekClient(responses=_responses(planner=TESTS_PLANNER))
+    orch, store = _orch(tmp_path, gh, ds)
+    out = orch.review_pr(make_pr())
+    assert out.action == "review"
+    # tests kind skips the module hint entirely: search once, fetch only the test file
+    assert gh.search_calls == 1 and gh.file_calls == 1
+    lens_users = ds.user_for("## LENS: correctness")
+    assert lens_users and all("EXISTING TEST" in u for u in lens_users)
+    assert any("test_close_reconnects" in u for u in lens_users)
+
+
+def test_kind_tests_no_test_like_hit_is_unresolved(tmp_path):
+    gh = FakeGhClient(
+        diff=SRC_DIFF,
+        search_results={"BaseConnector": [{"path": "src/base.py"}]},  # no test-like path
+        file_contents={"src/base.py": BASE_SRC},
+    )
+    ds = FakeDeepSeekClient(responses=_responses(planner=TESTS_PLANNER))
+    orch, store = _orch(tmp_path, gh, ds)
+    out = orch.review_pr(make_pr())
+    assert out.action == "review"
+    assert gh.file_calls == 0  # no test-like hit -> never fetched
+    for pass_key in ("## LENS: correctness", "## PASS: scoring"):
+        users = ds.user_for(pass_key)
+        assert users and all("UNRESOLVED" in u and "BaseConnector" in u for u in users)
+
+
 def _orch_with_bus(tmp_path, gh, ds, **cfg_kw):
     """Like ``_orch`` but wires a real EventBus and returns the recorded
     AgentEvents so the planner's progress signal can be asserted."""
@@ -178,7 +238,9 @@ def test_planner_emits_context_agent_running_then_done(tmp_path):
     assert all(e.pr_number == make_pr().number for e in ctx)
 
 
-def test_planner_failure_emits_failed_context_event(tmp_path):
+def test_planner_failure_emits_failed_context_event(tmp_path, monkeypatch):
+    monkeypatch.setattr("ghcr.review.PLANNER_RETRY_DELAY_S", 0)
+
     def fail_planner(system, user):
         raise DeepSeekError("planner down")
 

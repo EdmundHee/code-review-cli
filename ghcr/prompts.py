@@ -192,11 +192,15 @@ security. These are what a reviewer would otherwise GUESS about.
 Per symbol: bare name + a module hint when the diff reveals its origin (an import or \
 dotted module path). Skip what the diff defines, builtins/stdlib, trivial well-known \
 helpers. Few load-bearing symbols beat a long speculative list.
+Diff changes a default value, registry entry, public constant, or documented behavior \
+that existing tests likely pin → request those EXISTING TESTS: same symbol, kind "tests" \
+(e.g. a changed DEFAULT_TIMEOUT default → the test asserting the old value). Only when a \
+pinned behavior changes; never speculative.
 
 Return ONLY a JSON object — no prose, no markdown fences:
 {"requests": [{"symbol": "<name>", "module_hint": "<import or dotted path, or empty>", \
-"reason": "<why its definition matters>"}]}
-Self-contained diff → {"requests": []}.
+"reason": "<why it matters>", "kind": "definition" | "tests"}]}
+"kind" omitted → "definition". Self-contained diff → {"requests": []}.
 """
 
 

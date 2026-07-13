@@ -86,26 +86,30 @@ class ReviewResult:
 # -- referenced-context fetch (multi-pass) ----------------------------------
 @dataclass(frozen=True)
 class ContextRequest:
-    """One symbol the planner pass asks to see defined before reviewing. ``module_hint``
-    is whatever the diff revealed about where it lives (an import or dotted path); it may
-    be empty, in which case resolution falls back to code search."""
+    """One symbol the planner pass asks to see before reviewing. ``module_hint`` is
+    whatever the diff revealed about where it lives (an import or dotted path); it may
+    be empty, in which case resolution falls back to code search. ``kind`` is
+    "definition" (fetch the symbol's source) or "tests" (fetch the EXISTING tests that
+    pin its current behavior — for a changed default/registry/public constant)."""
 
     symbol: str
     module_hint: str = ""
     reason: str = ""
+    kind: str = "definition"  # "definition" | "tests"
 
 
 @dataclass(frozen=True)
 class ReferencedSnippet:
     """One resolved snippet fetched from the repo for a symbol the diff references
     but does not show. ``kind`` is "definition" (a recognized def/class/binding —
-    authoritative ground truth) or "usage" (only a mention window was found — must
-    NOT be presented as a verified definition)."""
+    authoritative ground truth), "usage" (only a mention window was found — must NOT
+    be presented as a verified definition), or "test" (an excerpt from an EXISTING
+    test that pins the symbol's current behavior)."""
 
     symbol: str
     path: str
     text: str
-    kind: str = "definition"  # "definition" | "usage"
+    kind: str = "definition"  # "definition" | "usage" | "test"
 
 
 # -- multi-pass review pipeline types --------------------------------------

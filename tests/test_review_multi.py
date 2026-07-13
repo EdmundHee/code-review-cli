@@ -109,6 +109,43 @@ def test_below_threshold_findings_filtered_but_still_posts(tmp_path):
     assert store.already_reviewed("owner/repo", 1, "a" * 40)
 
 
+def test_dropped_finding_logged_with_details(tmp_path, caplog):
+    import logging
+
+    gh = FakeGhClient(diff=SRC_DIFF)
+    ds = FakeDeepSeekClient(responses=_responses(score=SCORE_LOW))
+    orch, store = _orch(tmp_path, gh, ds)
+    with caplog.at_level(logging.INFO, logger="ghcr.review"):
+        orch.review_pr(make_pr())
+    drops = [r for r in caplog.records if r.getMessage().startswith("finding dropped")]
+    assert len(drops) == 1
+    msg = drops[0].getMessage()
+    assert "lens=correctness" in msg and "severity=BLOCKER" in msg
+    assert "file=src/app.py" in msg
+    assert "confidence=50" in msg and "threshold=80" in msg
+    assert "returns wrong value" in msg and "reason=maybe" in msg
+    assert "\n" not in msg  # single-line for grep-ability
+
+
+def test_dropped_finding_issue_truncated_and_single_line(tmp_path, caplog):
+    import logging
+
+    long_issue = "wrong\nvalue " + "x" * 300
+    corr = (
+        '[{"severity":"WARNING","file":"src/app.py","area":"f",'
+        f'"issue":"{long_issue.replace(chr(10), " ")}","fix":"fix"}}]'
+    )
+    gh = FakeGhClient(diff=SRC_DIFF)
+    ds = FakeDeepSeekClient(responses=_responses(corr=corr, score=SCORE_LOW))
+    orch, store = _orch(tmp_path, gh, ds)
+    with caplog.at_level(logging.INFO, logger="ghcr.review"):
+        orch.review_pr(make_pr())
+    msg = [r.getMessage() for r in caplog.records if r.getMessage().startswith("finding dropped")][0]
+    issue_part = msg.split("issue=", 1)[1]
+    assert len(issue_part) <= 200
+    assert "\n" not in msg
+
+
 def test_tests_present_shows_check_mark(tmp_path):
     gh = FakeGhClient(diff=SRC_DIFF)
     ds = FakeDeepSeekClient(responses=_responses(corr=EMPTY, cov=COV_YES))

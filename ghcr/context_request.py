@@ -42,12 +42,39 @@ def parse_context_requests(raw: str) -> list[ContextRequest]:
         sym = str(el.get("symbol", "") or "").strip()
         if not sym:
             continue
+        kind = "tests" if str(el.get("kind", "") or "").strip().lower() in ("tests", "test") else "definition"
         out.append(ContextRequest(
             symbol=sym,
             module_hint=str(el.get("module_hint", "") or "").strip(),
             reason=str(el.get("reason", "") or "").strip(),
+            kind=kind,
         ))
     return out
+
+
+# Repo-agnostic test-file heuristic for the planner's kind="tests" requests. Distinct
+# from pipeline.is_test_path (which is config-glob-driven per watched repo) — resolution
+# runs against arbitrary repos, so it needs a fixed structural rule, not repo config.
+_TEST_DIR_SEGMENTS = {"test", "tests", "spec", "__tests__"}
+
+
+def is_test_like_path(path: str) -> bool:
+    """True when ``path`` looks like a test file: a test/ dir segment, a ``test_``
+    filename prefix, a ``.test.``/``.spec.`` infix (JS), or a ``_test.<ext>`` suffix
+    (Go). Segment/prefix based so ``contest.py`` / ``db/base.py`` do NOT match."""
+    parts = [p.lower() for p in re.split(r"[\\/]+", path.strip()) if p]
+    if not parts:
+        return False
+    if any(seg in _TEST_DIR_SEGMENTS for seg in parts[:-1]):
+        return True
+    name = parts[-1]
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    return (
+        name.startswith("test_")
+        or ".test." in name
+        or ".spec." in name
+        or stem.endswith("_test")
+    )
 
 
 # -- symbol resolution helpers ----------------------------------------------
@@ -197,10 +224,16 @@ _HEADER = (
     "## REFERENCED DEFINITIONS (fetched from the repo at this commit — authoritative "
     "for code not in the diff)\n"
     "Real definitions of symbols the diff uses but does not show. Treat them as ground "
-    "truth; do not assume behavior beyond what they reveal.\n"
+    "truth; do not assume behavior beyond what they reveal. May include EXISTING TESTS "
+    "that pin current behavior — if the diff changes that behavior, the test is stale.\n"
 )
 
 _USAGE_CAVEAT = " (nearby usage only — NOT a verified definition; do not treat as ground truth)"
+
+_TEST_NOTE = (
+    " (EXISTING TEST — pins the CURRENT behavior at this commit; if the diff changes "
+    "that behavior, this test is stale evidence and likely needs updating)"
+)
 
 
 def render_referenced_context(snippets, *, max_chars: int, unresolved=()) -> str:
@@ -219,7 +252,12 @@ def render_referenced_context(snippets, *, max_chars: int, unresolved=()) -> str
     used = 0
     omitted = 0
     for s in snippets:
-        caveat = _USAGE_CAVEAT if s.kind == "usage" else ""
+        if s.kind == "usage":
+            caveat = _USAGE_CAVEAT
+        elif s.kind == "test":
+            caveat = _TEST_NOTE
+        else:
+            caveat = ""
         entry = f"### {s.symbol} — {s.path}{caveat}\n```\n{s.text.strip()}\n```"
         if kept and used + len(entry) > max_chars:
             omitted += 1

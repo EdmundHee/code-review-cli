@@ -108,6 +108,12 @@ def test_context_request_prompt_has_route_header_and_requests_shape():
     assert "requests" in CONTEXT_REQUEST_PROMPT
 
 
+def test_context_request_prompt_offers_tests_kind():
+    assert '"kind"' in CONTEXT_REQUEST_PROMPT
+    assert "tests" in CONTEXT_REQUEST_PROMPT
+    assert "EXISTING TESTS" in CONTEXT_REQUEST_PROMPT
+
+
 def test_build_context_request_user_prompt_includes_diff():
     assert "THE DIFF" in build_context_request_user_prompt(make_pr(), _fd())
 
