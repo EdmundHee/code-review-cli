@@ -21,11 +21,17 @@ review as a comment using a **dedicated bot GitHub account**.
 - **@mention to re-review:** comment `@<bot_login>` on a PR and the bot runs a fresh
   review on the next poll — no new commit needed (toggle `review.rereview_on_mention`,
   default on). Otherwise it only reviews on a new commit (deduped by head SHA).
-- **Claude Opus advisor (optional):** set `review.advisor_provider: claude` to route the
-  planner + scoring passes to Claude Opus via the `claude -p` CLI — using your Claude
-  **subscription** (not API credits) for cross-model verification and lower DeepSeek spend.
-  Lenses stay on DeepSeek. Needs a logged-in `claude` CLI and the `claude:` config block;
-  restart to apply. Default off (DeepSeek does everything).
+- **Cross-model advisor (optional):** `review.advisor_provider` routes the planner +
+  scoring passes to a *different* model than the lenses (which always stay on DeepSeek) —
+  so a finding is refuted by a different model than raised it, and DeepSeek's dominant
+  scoring-token cost drops. Restart to apply. Three values:
+  - `deepseek` (default) — DeepSeek does everything.
+  - `claude` — Claude Opus via the `claude -p` CLI, using your Claude **subscription**
+    (not API credits). Needs a logged-in `claude` CLI + the `claude:` config block.
+  - `openai` — any OpenAI-compatible endpoint (e.g. **GLM-5.2** on a Z.ai Coding Plan).
+    Needs the `advisor:` config block + its `api_key_env` exported. For a Z.ai **Coding
+    Plan** key, `base_url` must be `https://api.z.ai/api/coding/paas/v4` — the pay-as-you-go
+    `api/paas/v4` path returns `429 Insufficient balance` even with a valid key.
 - Skips drafts, ignored authors, and its own PRs; skips noisy files and caps
   diff size + a rolling 24h USD budget.
 
@@ -44,6 +50,8 @@ Secrets come from env (never the YAML):
 ```bash
 export GH_TOKEN="<bot account fine-grained PAT>"   # NOT your personal token
 export DEEPSEEK_API_KEY="<deepseek key>"
+# Only if advisor_provider: openai — the advisor's api_key_env (name is your choice):
+export ZAI_API_KEY="<GLM / OpenAI-compatible advisor key>"
 ```
 
 **Bot PAT scopes (fine-grained, only the watched repos):** Pull requests R/W,

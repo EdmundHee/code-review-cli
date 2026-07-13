@@ -39,6 +39,7 @@ DEFAULT_ANSWERS = [
     "",           # 27 review mode
     "",           # 28 confidence threshold
     "",           # 29 scoring votes
+    "",           # 30 advisor provider (default deepseek -> no further prompts)
 ]
 
 
@@ -77,6 +78,21 @@ def test_wizard_backs_up_existing(tmp_path, monkeypatch):
     bak = tmp_path / "config.yaml.bak"
     assert bak.exists()
     assert "bot_login: old" in bak.read_text()
+
+
+def test_wizard_prompts_for_openai_advisor(tmp_path, monkeypatch):
+    p = tmp_path / "config.yaml"
+    # Same deepseek defaults, but pick 'openai' at the advisor prompt and accept
+    # the GLM block defaults (base_url/model/api_key_env/thinking/timeout/prices).
+    answers = DEFAULT_ANSWERS[:-1] + ["openai", "", "", "", "", "", "", ""]
+    env = {**ENV, "ZAI_API_KEY": "z"}
+    assert _run(p, answers, monkeypatch, env=env) == 0
+    cfg = load_config(str(p), env=env)
+    assert cfg.review.advisor_provider == "openai"
+    assert cfg.advisor is not None
+    assert cfg.advisor.base_url == "https://api.z.ai/api/coding/paas/v4"
+    assert cfg.advisor.model == "glm-5.2"
+    assert cfg.advisor.send_thinking_extra_body is False
 
 
 def test_wizard_prefills_from_existing(tmp_path, monkeypatch):

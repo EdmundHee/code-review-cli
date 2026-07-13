@@ -33,6 +33,27 @@ def build_claude_argv(claude_path: str, model: str, system_prompt: str) -> list[
     ]
 
 
+def _extract_error(stdout: str, stderr: str) -> str:
+    """Best-effort error string from a failed claude -p call. In ``--output-format
+    json`` claude writes API errors to STDOUT (``api_error_status`` + ``result``) and
+    leaves stderr EMPTY — so reading stderr alone yields a blank message. Read the
+    JSON body first, fall back to stderr, then to raw stdout."""
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        data = None
+    if isinstance(data, dict):
+        parts = []
+        if data.get("api_error_status"):
+            parts.append(f"api_error_status={data['api_error_status']}")
+        msg = (data.get("result") or "").strip()
+        if msg:
+            parts.append(msg)
+        if parts:
+            return " ".join(parts)[:500]
+    return ((stderr or "").strip() or (stdout or "").strip() or "(no output)")[:500]
+
+
 class ClaudeCliClient:
     def __init__(
         self,
@@ -62,7 +83,7 @@ class ClaudeCliClient:
 
         if proc.returncode != 0:
             raise ClaudeCliError(
-                f"claude -p exited {proc.returncode}: {(proc.stderr or '').strip()[:500]}"
+                f"claude -p exited {proc.returncode}: {_extract_error(proc.stdout, proc.stderr)}"
             )
         try:
             data = json.loads(proc.stdout)
@@ -75,12 +96,20 @@ class ClaudeCliClient:
         if not isinstance(data, dict):
             raise ClaudeCliError(f"claude -p returned non-object JSON: {type(data).__name__}")
 
+        # claude can exit 0 yet flag an API error in the body — treat as failure.
+        if data.get("is_error"):
+            raise ClaudeCliError(f"claude -p reported error: {_extract_error(proc.stdout, proc.stderr)}")
+
         content = (data.get("result") or "").strip()
         if not content:
             raise ClaudeCliError("claude -p returned empty result")
 
+        # Count cache tokens too: input_tokens excludes cache_creation/cache_read,
+        # which are the bulk of input on a cached subscription call (else we undercount).
         u = data.get("usage") or {}
-        in_tok = int(u.get("input_tokens", 0) or 0)
+        in_tok = (int(u.get("input_tokens", 0) or 0)
+                  + int(u.get("cache_creation_input_tokens", 0) or 0)
+                  + int(u.get("cache_read_input_tokens", 0) or 0))
         out_tok = int(u.get("output_tokens", 0) or 0)
         usage = Usage(prompt_tokens=in_tok, completion_tokens=out_tok, total_tokens=in_tok + out_tok)
         return ReviewResult(content=content, usage=usage, model=self.model)

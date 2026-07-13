@@ -12,7 +12,7 @@ The package is split into **pure modules** (no I/O, no SDK, trivially testable) 
   `pipeline.py` (JSON parsing, dedup, test-file classification, markdown synthesis),
   `prior_context.py` (parse PR comments, render context block, `find_mention_triggers`),
   `context_request.py` (parse the planner pass, `module_path_candidates`,
-  `extract_symbol_snippet` — language-aware, kind-tagged "definition"/"usage" —
+  `extract_symbol_snippet` — language-aware, kind-tagged "definition"/"usage"/"test"; `is_test_like_path` —
   render the referenced-definitions block incl. the UNRESOLVED list),
   `diff_filter.py` (incl. `file_hunks`), `cost.py`, `comment.py`.
 - **I/O:** `review.py` (`ReviewOrchestrator` — the composition root), `deepseek.py`
@@ -66,32 +66,45 @@ unseen code (a called method, a base class, a field's meaning) and fire confiden
 To fix the root cause, multi optionally fetches the real source: after `classify_test_signal` and
 **after the budget gate** (it is spend), `_fetch_referenced_context` runs a **planner** call
 (`CONTEXT_REQUEST_PROMPT`, header `## PASS: context`, **thinking disabled** — listing symbols
-needs no reasoning spend) that lists the unseen symbols it needs; `_resolve_symbol` resolves each
-hybrid — `context_request.module_path_candidates` on the planner's `module_hint` first (tries
-Python AND JS/TS/Go/Ruby layouts), else `gh search_code` — fetches it at the PR head SHA
+needs no reasoning spend) that lists the unseen symbols it needs; a **transient planner failure
+gets ONE app-level retry** after `PLANNER_RETRY_DELAY_S` (main-thread sleep, blocks the poller;
+second failure degrades to diff-only) — the SDK's own retries cover blips, this covers a longer
+window (a single Connection error once silently dropped a whole review to diff-only). `_resolve_symbol`
+resolves each hybrid — `context_request.module_path_candidates` on the planner's `module_hint` first
+(tries Python AND JS/TS/Go/Ruby layouts), else `gh search_code` — fetches it at the PR head SHA
 (`gh get_file_content`, raw blob), and `extract_symbol_snippet` slices the def **and tags its
 kind**: a recognized definition renders as authoritative; a bare-mention fallback window renders
-with a "NOT a verified definition" caveat so it can never pose as ground truth. Symbols whose
-lookup failed entirely are rendered in an **UNRESOLVED list** — that is what makes the scoring
-**confidence cap at 25 for unresolved symbols** mechanically triggerable instead of hoping the
-model notices the gap. On by default (`review.fetch_referenced_context`); sized by
-`referenced_max_symbols` / `referenced_context_max_chars` / `referenced_search_limit`. The planner's
+with a "NOT a verified definition" caveat so it can never pose as ground truth. The planner may also
+request **kind="tests"** for a symbol whose changed default/registry/public constant existing tests
+likely pin; `_resolve_tests` skips the module hint, code-searches, picks the first
+`is_test_like_path` hit, and renders it tagged **kind="test"** ("EXISTING TEST — pins current
+behavior") so the lens/scorer read it as stale-if-behavior-changed, not as a definition. Symbols
+whose lookup failed entirely (definition or tests) are rendered in an **UNRESOLVED list** — that is
+what makes the scoring **confidence cap at 25 for unresolved symbols** mechanically triggerable
+instead of hoping the model notices the gap. On by default (`review.fetch_referenced_context`); sized
+by `referenced_max_symbols` / `referenced_context_max_chars` / `referenced_search_limit`. The planner's
 usage is aggregated into the review cost. This is the one place multi relaxes diff-only.
 
 **Advisor provider (multi only).** `review.advisor_provider` (default `deepseek`) routes the
-**planner + scoring** passes to Claude Opus via the `claude -p` CLI (`ghcr/claude_cli.py`,
-`ClaudeCliClient`) — leveraging a Claude **subscription** (CLI OAuth, not API credits) instead of
-DeepSeek tokens. **Lenses stay on DeepSeek** (the bulk finder). Two wins: cross-model verification
-(a *different* model refutes a finding than raised it — now "agreement isn't verification" holds for
-real), and DeepSeek's dominant token cost (scoring = findings×votes) drops to $0. The orchestrator
-holds two clients — `self.deepseek` (worker: lenses + single mode) and `self.advisor` (planner +
-scoring); when `advisor_provider` is `deepseek`, `self.advisor IS self.deepseek` and cost/behavior is
-byte-for-byte unchanged. Cost is split into two provider-priced buckets (`_split_cost`): worker usage
-× `deepseek.prices`, advisor usage × `claude.prices` (default 0/0 → $0, budget never blocks).
-`ClaudeCliError ⊂ DeepSeekError`, so the existing best-effort planner/scoring catches degrade a CLI
-failure gracefully. The advisor client is built once at startup (`cli._build`) — **restart-only**;
-flipping `advisor_provider` live has no effect until restart. Off by default; configured via the
-`claude:` block (`claude_path`/`model`/`request_timeout_seconds`/`prices`).
+**planner + scoring** passes to a *different* model than the lenses. Three values: `deepseek`
+(DeepSeek does everything), `claude` (Claude Opus via the `claude -p` CLI — `ghcr/claude_cli.py`,
+`ClaudeCliClient`; a Claude **subscription**, CLI OAuth not API credits), and `openai` (any
+**OpenAI-compatible** endpoint — e.g. GLM-5.2 via a Z.ai Coding Plan — built as a second
+`DeepSeekClient` in `cli._build`, configured by the `advisor:` block). **Lenses stay on DeepSeek**
+(the bulk finder) in every case. Two wins: cross-model verification (a *different* model refutes a
+finding than raised it — now "agreement isn't verification" holds for real), and DeepSeek's dominant
+token cost (scoring = findings×votes) drops to $0. The orchestrator holds two clients —
+`self.deepseek` (worker: lenses + single mode) and `self.advisor` (planner + scoring); when
+`advisor_provider` is `deepseek`, `self.advisor IS self.deepseek` and cost/behavior is byte-for-byte
+unchanged. Cost is split into two provider-priced buckets (`_split_cost`): worker usage ×
+`deepseek.prices`, advisor usage × the advisor's `prices` (`claude.prices` or `advisor.prices`,
+default 0/0 → $0, budget never blocks). `ClaudeCliError ⊂ DeepSeekError`, so the existing best-effort
+planner/scoring catches degrade an advisor failure gracefully. The advisor client is built once at
+startup (`cli._build`) — **restart-only**; flipping `advisor_provider` live has no effect until
+restart. Off by default; the `openai` path is configured via the `advisor:` block
+(`base_url`/`model`/`api_key_env`/`send_thinking_extra_body`/`request_timeout_seconds`/`prices`) —
+`send_thinking_extra_body: false` (default) drops DeepSeek's `thinking` extra_body a generic
+OpenAI-compatible endpoint rejects.
 
 **Per-provider usage in the TUI.** Tokens are tracked split by **real provider** — worker (DeepSeek,
 lenses) vs advisor (Claude, planner+scoring). `_provider_usage` attributes by the *actual* provider,
@@ -178,3 +191,56 @@ display collapses to a single model — unchanged.
 - Under the parallel pipeline, **assert call counts/sets, never order** (the fake's counter
   is lock-guarded; `calls_matching(substr)` helps).
 - New pure logic is TDD'd first (`test_pipeline.py`, `test_models.py`, `test_prompts.py`).
+
+<!-- codemap:start -->
+## Codemap — MANDATORY USAGE RULES
+
+This project has a **codemap MCP server** with pre-indexed code structure, call graphs, and relationships.
+The following rules are **NOT optional** — follow them for every task.
+
+### Before Writing New Code
+- ALWAYS call `codemap_query` to search for existing functions that do something similar
+- ALWAYS call `codemap_module` on the target directory to understand what's already there
+- If you find similar functions, reuse or extend them — do NOT create duplicates
+- For larger features, use `/codemap-find-reusable` to systematically search for reuse opportunities
+
+### Before Modifying Existing Code
+- ALWAYS call `codemap_callers` on any function you plan to change — know the blast radius
+- ALWAYS call `codemap_calls` to understand what the function depends on
+- Or use `codemap_explore` to see the full call-graph neighborhood in one call (callers + callees at configurable depth)
+- If there are >5 callers, explain the impact before proceeding
+- Use `codemap_dependencies` to trace file-level imports/dependents
+
+### Before Planning
+- Call `codemap_overview` to orient yourself in the project structure
+- Call `codemap_module` on directories relevant to the task
+- Call `codemap_query` to find existing code related to the feature
+- Use `/codemap-plan` for complex multi-step implementations
+
+### After Code Generation (completing a task)
+- Call `codemap_health` to verify the health score didn't degrade
+- Call `codemap_analyze` to check for introduced duplicates or dead code
+- If health score dropped, explain what caused the regression
+- Run `/codemap-refresh` to keep the codemap in sync with your changes
+
+### Tool Priority
+Use `codemap_*` tools **INSTEAD OF** grep/Glob/Read for:
+- Finding function/class definitions → `codemap_query` (returns clustered results — hubs first, helpers folded)
+- Understanding what calls what → `codemap_callers` / `codemap_calls`
+- Exploring call-graph neighborhood → `codemap_explore` (BFS traversal: callers + callees in one call)
+- Exploring project structure → `codemap_overview` / `codemap_module`
+- Checking code quality → `codemap_health` / `codemap_analyze`
+- Checking file dependencies → `codemap_dependencies`
+- Finding DRY violations → `codemap_structures` with type "duplicates"
+- Finding circular imports → `codemap_structures` with type "circular_deps"
+
+### Workflows (for multi-step tasks)
+- `/codemap-explore` — understand the project structure and architecture
+- `/codemap-find-reusable` — search for existing code to reuse before writing new functions
+- `/codemap-impact` — analyze blast radius before refactoring or modifying code
+- `/codemap-plan` — create an implementation plan grounded in actual code structure
+- `/codemap-analyze` — run full analysis: dead code, duplicates, circular deps
+- `/codemap-health-review` — review code quality and identify what to refactor next
+- `/codemap-refresh` — regenerate codemap when source files have changed
+- `/codemap-usage` — view MCP tool usage statistics with 5-hour interval breakdown
+<!-- codemap:end -->

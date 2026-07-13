@@ -83,12 +83,17 @@ review:
   prior_comment_max_chars: 6000       # budget for the rendered prior-discussion block
   rereview_on_mention: true           # a new comment that @mentions the bot triggers a fresh
                                       # full review (no new commit needed). false to disable.
-  advisor_provider: deepseek          # deepseek (default) | claude. "claude" routes the
-                                      # planner + scoring passes to Claude Opus via the
-                                      # `claude -p` CLI (your subscription), leaving lenses
-                                      # on DeepSeek — cross-model verification + lower
-                                      # DeepSeek token cost. Requires the `claude:` block
-                                      # below and a logged-in `claude` CLI. Restart to apply.
+  advisor_provider: deepseek          # who runs the planner + scoring passes. Lenses always
+                                      # stay on DeepSeek; only these two passes move. Restart to apply.
+                                      #   deepseek — default; DeepSeek does everything (no extra block).
+                                      #   claude   — Claude Opus via the `claude -p` CLI (your Claude
+                                      #              subscription, no API key). Needs the `claude:` block
+                                      #              below + a logged-in `claude` CLI.
+                                      #   openai   — any OpenAI-compatible endpoint (e.g. GLM-5.2 via a
+                                      #              Z.ai Coding Plan). Needs the `advisor:` block below +
+                                      #              its api_key_env exported.
+                                      # claude/openai both give cross-model verification (a different
+                                      # model refutes the finding than raised it) + lower DeepSeek spend.
 
 # Only used when review.advisor_provider: claude. Auth comes from the Claude CLI's own
 # login (a subscription), NOT an API key — run `claude` once interactively to log in.
@@ -98,6 +103,20 @@ claude:
   request_timeout_seconds: 600
   prices:                             # USD per 1M tokens — subscription is flat, so 0/0
     input_per_1m: 0.0                 # → advisor passes are reported as $0 (budget never blocks)
+    output_per_1m: 0.0
+
+# Only used when review.advisor_provider: openai. A generic OpenAI-compatible advisor
+# (a second client pointed at base_url). Example below = GLM-5.2 on a Z.ai Coding Plan.
+advisor:
+  base_url: https://api.z.ai/api/coding/paas/v4   # SUBSCRIPTION endpoint. NOT api/paas/v4 —
+                                      # the pay-as-you-go path returns 429 "Insufficient balance"
+                                      # even with a valid Coding-Plan key.
+  model: glm-5.2
+  api_key_env: ZAI_API_KEY            # NAME of the env var holding the key (never the key itself)
+  send_thinking_extra_body: false     # DeepSeek-only `thinking` extra_body; GLM rejects it — keep false
+  request_timeout_seconds: 600
+  prices:                             # USD per 1M tokens — flat subscription → 0/0 reports $0
+    input_per_1m: 0.0
     output_per_1m: 0.0
 
 storage:

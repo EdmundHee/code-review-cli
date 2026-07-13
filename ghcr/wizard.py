@@ -146,6 +146,43 @@ def run_wizard(path: str, env=None, *, console: Console | None = None) -> int:
     confidence_threshold = ask.integer("confidence threshold (keep findings scored >= this)", default=int(_g(cur, "review", "confidence_threshold", default=80)))
     scoring_votes = ask.integer("scoring votes per finding (odd = clean median)", default=int(_g(cur, "review", "scoring_votes", default=1)))
 
+    # -- advisor provider -------------------------------------------------
+    out.print(
+        "\n[bold]Advisor provider[/bold] [dim](routes the planner + scoring passes; "
+        "default = DeepSeek does everything)[/dim]"
+    )
+    advisor_provider = ask.choice(
+        "advisor provider",
+        ["deepseek", "claude", "openai"],
+        default=_g(cur, "review", "advisor_provider", default="deepseek"),
+    )
+    claude_block = None
+    advisor_block = None
+    if advisor_provider == "claude":
+        out.print("[dim]Claude Opus via the `claude -p` CLI — auth is the CLI's own login (a subscription), no API key.[/dim]")
+        claude_block = {
+            "claude_path": ask.text("claude CLI path", default=_g(cur, "claude", "claude_path", default="claude")),
+            "model": ask.text("claude model alias", default=_g(cur, "claude", "model", default="opus")),
+            "request_timeout_seconds": ask.integer("claude request timeout (s)", default=int(_g(cur, "claude", "request_timeout_seconds", default=600))),
+            "prices": {
+                "input_per_1m": ask.number("claude price per 1M input tokens (USD)", default=float(_g(cur, "claude", "prices", "input_per_1m", default=0.0))),
+                "output_per_1m": ask.number("claude price per 1M output tokens (USD)", default=float(_g(cur, "claude", "prices", "output_per_1m", default=0.0))),
+            },
+        }
+    elif advisor_provider == "openai":
+        out.print("[dim]Generic OpenAI-compatible endpoint (e.g. GLM-5.2 on a Z.ai Coding Plan).[/dim]")
+        advisor_block = {
+            "base_url": ask.text("advisor base url", default=_g(cur, "advisor", "base_url", default="https://api.z.ai/api/coding/paas/v4")),
+            "model": ask.text("advisor model", default=_g(cur, "advisor", "model", default="glm-5.2")),
+            "api_key_env": ask.text("env var holding the advisor API key", default=_g(cur, "advisor", "api_key_env", default="ZAI_API_KEY")),
+            "send_thinking_extra_body": ask.confirm("send DeepSeek-style `thinking` extra_body? (GLM: no)", default=bool(_g(cur, "advisor", "send_thinking_extra_body", default=False))),
+            "request_timeout_seconds": ask.integer("advisor request timeout (s)", default=int(_g(cur, "advisor", "request_timeout_seconds", default=600))),
+            "prices": {
+                "input_per_1m": ask.number("advisor price per 1M input tokens (USD)", default=float(_g(cur, "advisor", "prices", "input_per_1m", default=0.0))),
+                "output_per_1m": ask.number("advisor price per 1M output tokens (USD)", default=float(_g(cur, "advisor", "prices", "output_per_1m", default=0.0))),
+            },
+        }
+
     skip_globs = list(_g(cur, "diff", "skip_globs", default=list(_DEFAULT_SKIP_GLOBS)))
     test_globs = list(_g(cur, "diff", "test_globs", default=list(_DEFAULT_TEST_GLOBS)))
 
@@ -184,10 +221,15 @@ def run_wizard(path: str, env=None, *, console: Console | None = None) -> int:
             "mode": review_mode,
             "confidence_threshold": confidence_threshold,
             "scoring_votes": scoring_votes,
+            "advisor_provider": advisor_provider,
         },
         "storage": {"db_path": db_path},
         "logging": {"level": log_level},
     }
+    if claude_block is not None:
+        data["claude"] = claude_block
+    if advisor_block is not None:
+        data["advisor"] = advisor_block
 
     _write_config(full, data)
 
@@ -198,10 +240,13 @@ def run_wizard(path: str, env=None, *, console: Console | None = None) -> int:
         return 1
 
     out.print(f"\n[green]✓ wrote {full}[/green] · {len(cfg.repos)} repo(s) · model={cfg.deepseek.model}")
-    out.print(
+    secrets_line = (
         f"[yellow]secrets are env-based:[/yellow] export [bold]{token_env}[/bold] (bot PAT) and "
-        f"[bold]{api_key_env}[/bold] (DeepSeek key) before running."
+        f"[bold]{api_key_env}[/bold] (DeepSeek key)"
     )
+    if advisor_block is not None:
+        secrets_line += f" and [bold]{advisor_block['api_key_env']}[/bold] (advisor key)"
+    out.print(secrets_line + " before running.")
     out.print("next: [bold]ghcr check-config[/bold] then [bold]ghcr tui[/bold]")
     return 0
 
