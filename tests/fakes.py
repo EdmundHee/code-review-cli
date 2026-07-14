@@ -16,6 +16,7 @@ from ghcr.config import (
 from ghcr.prompts import LENS_NAMES
 from ghcr.cost import Prices
 from ghcr.github import GhError
+from ghcr.gitrepo import GitError
 from ghcr.models import PullRequest, ReviewResult, Usage
 
 DEFAULT_SKIP = ("**/*.lock", "**/*.png", "**/dist/**")
@@ -39,7 +40,10 @@ def make_config(
     skip_globs=DEFAULT_SKIP,
     model: str = "deepseek-v4-pro",
     review_mode: str = "single",
-    lenses=LENS_NAMES,
+    # Pinned to the original 4 lenses (NOT LENS_NAMES, which now includes
+    # "consistency") so existing multi-pass call-count assertions stay stable;
+    # production defaults to all of LENS_NAMES. Consistency tests opt in explicitly.
+    lenses=("correctness", "security", "maintainability", "test_coverage"),
     confidence_threshold: int = 80,
     scoring_votes: int = 1,
     max_parallel: int = 0,
@@ -54,9 +58,17 @@ def make_config(
     referenced_context_max_chars: int = 6000,
     referenced_search_limit: int = 5,
     advisor_provider: str = "deepseek",
+    agentic_scoring: bool = False,
+    local_checkout: bool = False,
+    # Convention fetch defaults OFF in tests (like fetch_referenced_context) so
+    # existing call-count assertions stay stable; production defaults ON.
+    fetch_conventions: bool = False,
+    conventions_max_chars: int = 6000,
+    git_path: str = "git",
+    repos_dir: str = "/tmp/ghcr-test-repos",
 ) -> Config:
     return Config(
-        github=GithubConfig(gh_path="/usr/bin/true", token="t", bot_login=bot_login, request_timeout_seconds=60),
+        github=GithubConfig(gh_path="/usr/bin/true", token="t", bot_login=bot_login, request_timeout_seconds=60, git_path=git_path),
         deepseek=DeepSeekConfig(
             api_key="k", base_url="https://api.deepseek.com", model=model,
             thinking="enabled", reasoning_effort="high", request_timeout_seconds=600,
@@ -94,9 +106,14 @@ def make_config(
             referenced_context_max_chars=referenced_context_max_chars,
             referenced_search_limit=referenced_search_limit,
             advisor_provider=advisor_provider,
+            agentic_scoring=agentic_scoring,
+            local_checkout=local_checkout,
+            fetch_conventions=fetch_conventions,
+            conventions_max_chars=conventions_max_chars,
         ),
         db_path=db_path,
         log_level="INFO",
+        repos_dir=repos_dir,
     )
 
 
@@ -176,6 +193,98 @@ class FakeGhClient:
             raise GhError(["pr", "comment"], 1, "boom")
         self.posted.append((repo, number, body))
         return f"https://github.com/{repo}/pull/{number}#issuecomment-1"
+
+
+class FakeGitRepoCache:
+    """Mirror of GitRepoCache for orchestrator tests. ``files`` keys on path,
+    ``grep_hits`` on symbol, both with a ``"*"`` catch-all. ``ensure_ok=False``
+    simulates an unavailable checkout; ``raises=True`` makes show/grep raise
+    GitError (mid-resolution failure → gh fallback)."""
+
+    def __init__(self, *, files=None, grep_hits=None, ensure_ok=True, raises=False,
+                 worktree_dir="/tmp/ghcr-test-wt"):
+        self.files = files or {}
+        self.grep_hits = grep_hits or {}
+        self.ensure_ok = ensure_ok
+        self.raises = raises
+        # worktree_dir=None simulates `git worktree add` failing (agentic degrade path).
+        self.worktree_dir = worktree_dir
+        self.ensure_calls = 0
+        self.show_calls = 0
+        self.grep_calls = 0
+        self.worktree_calls = 0
+        self.remove_calls = 0
+
+    def ensure(self, repo, pr_number, head_sha):
+        self.ensure_calls += 1
+        return self.ensure_ok
+
+    def worktree(self, repo, sha):
+        self.worktree_calls += 1
+        return self.worktree_dir
+
+    def remove_worktree(self, repo, path):
+        self.remove_calls += 1
+
+    def show(self, repo, sha, path):
+        self.show_calls += 1
+        if self.raises:
+            raise GitError(["show"], 1, "boom")
+        if path in self.files:
+            return self.files[path]
+        if "*" in self.files:
+            return self.files["*"]
+        raise GitError(["show"], 128, f"path {path} does not exist")
+
+    def grep_paths(self, repo, symbol, sha, limit=5):
+        self.grep_calls += 1
+        if self.raises:
+            raise GitError(["grep"], 1, "boom")
+        hits = self.grep_hits.get(symbol, self.grep_hits.get("*", []))
+        return list(hits)[:limit]
+
+
+class FakeAgenticVerifier:
+    """Agentic scoring double — exposes ``verify(system, user, *, cwd)`` with the same
+    system-prompt-substring routing as the other fakes, plus a ``prices`` attr (0/0) and
+    a ``model`` tag. Records the ``cwd`` of every call so tests can assert the worktree
+    was passed through. Lock-guarded (scoring calls it from the thread pool)."""
+
+    def __init__(self, *, content='{"confidence": 90, "reason": "verified in checkout"}',
+                 usage=None, raises=False, responses=None, model: str = "glm-4.7"):
+        self.content = content
+        self.usage = usage or Usage(prompt_tokens=300, completion_tokens=40, total_tokens=340)
+        self.raises = raises
+        self.responses = responses or {}
+        self.prices = Prices(0.0, 0.0)
+        self.model = model
+        self._lock = threading.Lock()
+        self.calls = 0
+        self.systems: list[str] = []
+        self.users: list[str] = []
+        self.cwds: list[str] = []
+
+    def verify(self, system_prompt, user_prompt, *, cwd):
+        with self._lock:
+            self.calls += 1
+            self.systems.append(system_prompt)
+            self.users.append(user_prompt)
+            self.cwds.append(cwd)
+        if self.raises:
+            from ghcr.claude_cli import ClaudeCliError
+
+            raise ClaudeCliError("verifier down")
+        return ReviewResult(content=self._route(system_prompt, user_prompt), usage=self.usage, model=self.model)
+
+    def _route(self, system_prompt, user_prompt):
+        for key, val in self.responses.items():
+            if key in system_prompt:
+                return val(system_prompt, user_prompt) if callable(val) else val
+        return self.content
+
+    def calls_matching(self, substr: str) -> int:
+        with self._lock:
+            return sum(1 for s in self.systems if substr in s)
 
 
 class FakeDeepSeekClient:

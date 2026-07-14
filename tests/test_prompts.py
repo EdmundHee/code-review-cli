@@ -1,6 +1,7 @@
 from ghcr.diff_filter import FilteredDiff
 from ghcr.models import Finding
 from ghcr.prompts import (
+    CONSISTENCY_SCORING_SYSTEM_PROMPT,
     CONTEXT_REQUEST_PROMPT,
     LENS_NAMES,
     LENS_PROMPTS,
@@ -8,6 +9,7 @@ from ghcr.prompts import (
     build_context_request_user_prompt,
     build_scoring_user_prompt,
     build_user_prompt,
+    conventions_block,
     coverage_hint,
 )
 from tests.fakes import make_pr
@@ -22,6 +24,9 @@ def test_every_lens_has_a_prompt_with_a_unique_header():
 def test_lenses_embed_false_positive_guidance():
     for name in LENS_NAMES:
         assert "false positives" in LENS_PROMPTS[name].lower()
+    # The bug-hunting lenses share the linter-noise guidance; the consistency lens
+    # uses its own referent-anchored guidance instead (see below).
+    for name in ("correctness", "security", "maintainability", "test_coverage"):
         assert "linter" in LENS_PROMPTS[name].lower()
 
 
@@ -174,3 +179,63 @@ def test_every_lens_requires_full_sentence_issue_and_fix():
     # comment — every lens must demand human-readable full sentences for them
     for name in LENS_NAMES:
         assert "full sentences" in LENS_PROMPTS[name].lower()
+
+
+# -- consistency lens + its dedicated scorer --------------------------------
+def test_consistency_is_a_lens_with_its_own_header():
+    assert "consistency" in LENS_NAMES
+    assert "## LENS: consistency" in LENS_PROMPTS["consistency"]
+
+
+def test_consistency_lens_allows_convention_findings_shared_guidance_forbids():
+    p = LENS_PROMPTS["consistency"]
+    # It must NOT carry the shared guidance's blanket "pedantic nitpicks" ban —
+    # that clause is exactly what suppresses these findings on the other lenses.
+    assert "Pedantic nitpicks" not in p
+    # ...and must instead anchor findings to a concrete referent.
+    assert "referent" in p.lower()
+    assert "CONVENTIONS" in p
+
+
+def test_other_lenses_keep_the_shared_guidance():
+    for name in ("correctness", "security", "maintainability", "test_coverage"):
+        assert "Pedantic nitpicks" in LENS_PROMPTS[name]
+        assert "referent" not in LENS_PROMPTS[name].lower()
+
+
+def test_consistency_scorer_has_unique_header_and_no_style_cap():
+    p = CONSISTENCY_SCORING_SYSTEM_PROMPT
+    assert "## PASS: scoring-consistency" in p
+    # It must NOT reuse the default scorer's cap-at-25 stylistic clause that kills
+    # consistency findings; it judges anchoring, not "is it a bug".
+    assert "stylistic point not explicitly required" not in p
+    for anchor in ("0:", "25:", "50:", "75:", "100:"):
+        assert anchor in p
+    assert '"confidence"' in p
+
+
+def test_conventions_block_wraps_or_omits():
+    assert conventions_block("") == ""
+    assert conventions_block("   ") == ""
+    out = conventions_block("### CLAUDE.md\nenterprise-only rule")
+    assert "## CONVENTIONS" in out and "enterprise-only rule" in out
+
+
+def test_build_scoring_user_prompt_includes_conventions_when_given():
+    f = Finding(severity="WARNING", file="a.py", area="g", issue="drift", fix="x", lens="consistency")
+    out = build_scoring_user_prompt(make_pr(), _fd(), f, conventions_context="CONV-MARK-XYZ")
+    assert "CONV-MARK-XYZ" in out and "## CONVENTIONS" in out
+    # omitted by default
+    assert "## CONVENTIONS" not in build_scoring_user_prompt(make_pr(), _fd(), f)
+
+
+def test_agentic_scoring_prompt_header_and_no_scoring_collision():
+    from ghcr.prompts import AGENTIC_SCORING_SYSTEM_PROMPT
+    first = AGENTIC_SCORING_SYSTEM_PROMPT.splitlines()[0]
+    assert first == "## PASS: agentic-scoring"
+    # Fake routing matches "## PASS: scoring" as a substring — it must NOT appear in the
+    # header line, or a fake keyed on scoring would mis-route agentic calls.
+    assert "## PASS: scoring" not in first
+    # Same JSON output contract as the other scorers (parse_score reused).
+    assert '"confidence"' in AGENTIC_SCORING_SYSTEM_PROMPT
+    assert "Read" in AGENTIC_SCORING_SYSTEM_PROMPT and "Grep" in AGENTIC_SCORING_SYSTEM_PROMPT

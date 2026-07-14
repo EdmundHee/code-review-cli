@@ -16,11 +16,12 @@ from datetime import datetime, timedelta, timezone
 
 from . import comment as comment_mod
 from .config import Config
-from .cost import estimate_cost_usd, estimate_input_tokens, per_chunk_diff_budget
+from .cost import Prices, estimate_cost_usd, estimate_input_tokens, per_chunk_diff_budget
 from .deepseek import DeepSeekError
 from .events import AgentEvent, DeepSeekDone
 from .diff_filter import DiffChunk, chunk_filtered_diff, chunk_view, filter_diff
 from .github import GhError
+from .gitrepo import GitError
 from .models import (
     ACTION_ERROR,
     ACTION_REREVIEWED,
@@ -56,6 +57,8 @@ from .pipeline import (
 )
 from .prior_context import build_prior_context, find_mention_triggers, max_comment_id
 from .prompts import (
+    AGENTIC_SCORING_SYSTEM_PROMPT,
+    CONSISTENCY_SCORING_SYSTEM_PROMPT,
     CONTEXT_REQUEST_PROMPT,
     LENS_PROMPTS,
     SCORING_SYSTEM_PROMPT,
@@ -63,6 +66,7 @@ from .prompts import (
     build_context_request_user_prompt,
     build_scoring_user_prompt,
     build_user_prompt,
+    conventions_block,
     coverage_hint,
 )
 
@@ -87,16 +91,24 @@ class ReviewOutcome:
 
 
 class ReviewOrchestrator:
-    def __init__(self, gh, deepseek, store, config: Config, now=None, bus=None, advisor=None):
+    def __init__(self, gh, deepseek, store, config: Config, now=None, bus=None, advisor=None,
+                 gitrepo=None, verifier=None):
         self.gh = gh
         self.deepseek = deepseek            # worker: lenses + single mode
         self.advisor = advisor or deepseek   # planner + scoring (defaults to worker)
+        self.verifier = verifier             # agentic scoring (claude -p + worktree); None = off
         self.store = store
         self.cfg = config
         self.bus = bus
+        self.gitrepo = gitrepo               # local-clone symbol resolution; None = gh-only
+        # single-slot memo so ``ensure`` runs at most once per review (across chunks)
+        self._git_ready: tuple[str, str] | None = None
+        self._git_ready_ok = False
+        self._scoring_agentic = False        # per-review flag; drives the TUI model tag on score:*
         self._now = now or (lambda: datetime.now(timezone.utc))
         self.worker_prices = config.deepseek.prices
         self.advisor_prices = getattr(self.advisor, "prices", config.deepseek.prices)
+        self.verifier_prices = getattr(self.verifier, "prices", Prices(0.0, 0.0))
 
     # -- decision (no spend, no DB write) --------------------------------
     def decide(self, pr: PullRequest) -> ReviewDecision:
@@ -121,6 +133,8 @@ class ReviewOrchestrator:
             decision = self.decide(pr)
             if decision.action != ACTION_REVIEW:
                 return ReviewOutcome(decision.action)  # transient skip: no DB row
+
+        self._git_ready = None  # ensure the local checkout at most once PER REVIEW
 
         ts = self._now().strftime("%Y-%m-%dT%H:%MZ")
         model = self.cfg.deepseek.model
@@ -295,12 +309,134 @@ class ReviewOrchestrator:
         self._emit_agent(pr, agent, "done", f"{len(snippets)}/{len(requests)} symbols")
         return block, [res.usage]
 
+    # Convention docs read at the PR head and fed to the consistency lens. CLAUDE.md
+    # is load-bearing; the other two are cheap best-effort extras.
+    _CONVENTION_FILES = ("CLAUDE.md", "CONTRIBUTING.md", "AGENTS.md")
+
+    def _fetch_conventions(self, pr: PullRequest) -> str:
+        """The repo's own convention docs at the PR head, for the consistency lens.
+
+        No model call — pure git/gh I/O, local-clone-first then gh, mirroring the symbol
+        resolvers. Fetched once per review (repo-level; reused across chunks). Best-effort
+        and gated: disabled, the lens off, or any failure yields ``""`` so the review
+        proceeds without conventions — a fetch must never fail a review."""
+        rc = self.cfg.review
+        if not rc.fetch_conventions or "consistency" not in rc.lenses:
+            return ""
+        try:
+            parts: list[str] = []
+            for path in self._CONVENTION_FILES:
+                text = self._read_repo_file(pr, path)
+                if text and text.strip():
+                    parts.append(f"### {path}\n{text.strip()}")
+            block = "\n\n".join(parts)
+            return block[: rc.conventions_max_chars]
+        except Exception:  # pragma: no cover - defensive; a convention fetch never fails a review
+            log.warning("convention fetch failed repo=%s pr=%s", pr.repo, pr.number, exc_info=True)
+            return ""
+
+    def _read_repo_file(self, pr: PullRequest, path: str) -> str | None:
+        """One repo file at the PR head, local-clone-first then gh; None if absent.
+        Same best-effort discipline as the symbol resolvers."""
+        if self._local_ready(pr):
+            try:
+                return self.gitrepo.show(pr.repo, pr.head_sha, path)
+            except GitError:
+                pass
+        try:
+            return self.gh.get_file_content(pr.repo, path, pr.head_sha)
+        except GhError:
+            return None
+
+    def _local_ready(self, pr: PullRequest) -> bool:
+        """True if the PR head is available in the local clone. Memoized per review
+        (single-slot) so ``ensure`` — the one network call — runs at most once even
+        across chunks. Never raises: ``ensure`` degrades any failure to False, and
+        every symbol then resolves via the gh path exactly as before."""
+        if self.gitrepo is None or not self.cfg.review.local_checkout:
+            return False
+        key = (pr.repo, pr.head_sha)
+        if self._git_ready != key:
+            self._git_ready = key
+            self._git_ready_ok = self.gitrepo.ensure(pr.repo, pr.number, pr.head_sha)
+        return self._git_ready_ok
+
+    def _agentic_worktree(self, pr: PullRequest) -> str | None:
+        """A PR-head worktree for the agentic scorer, or None. Gated on the verifier
+        being configured + ``agentic_scoring`` + the local clone being ready (reuses the
+        memoized ``ensure``). Main-thread only (called before the scoring fan-out, like
+        ``_fetch_conventions``). Best-effort — any failure → None → prompt-only scoring."""
+        if self.verifier is None or not self.cfg.review.agentic_scoring:
+            return None
+        if not self._local_ready(pr):
+            return None
+        return self.gitrepo.worktree(pr.repo, pr.head_sha)
+
+    def _resolve_symbol_local(self, pr: PullRequest, req) -> ReferencedSnippet | None:
+        """Local-clone resolution of a definition/usage request. Mirrors the gh path:
+        try the module hint's paths, else grep the symbol; read at the head SHA; slice.
+        Any GitError / miss returns None so the caller falls back to gh."""
+        if not self._local_ready(pr):
+            return None
+        text, path = None, None
+        for hint_path in module_path_candidates(req.module_hint):
+            try:
+                text, path = self.gitrepo.show(pr.repo, pr.head_sha, hint_path), hint_path
+                break
+            except GitError:
+                text = None
+        if text is None:
+            try:
+                hits = self.gitrepo.grep_paths(
+                    pr.repo, req.symbol, pr.head_sha, self.cfg.review.referenced_search_limit)
+            except GitError:
+                hits = []
+            path = hits[0] if hits else None
+            if path:
+                try:
+                    text = self.gitrepo.show(pr.repo, pr.head_sha, path)
+                except GitError:
+                    text = None
+        if not text or not path:
+            return None
+        got = extract_symbol_snippet(text, req.symbol)
+        if not got:
+            return None
+        body, kind = got
+        return ReferencedSnippet(symbol=req.symbol, path=path, text=body, kind=kind)
+
+    def _resolve_tests_local(self, pr: PullRequest, req) -> ReferencedSnippet | None:
+        """Local-clone resolution of a kind="tests" request. Grep the symbol, pick the
+        first test-like path, read at the head SHA. Any GitError / miss returns None."""
+        if not self._local_ready(pr):
+            return None
+        try:
+            hits = self.gitrepo.grep_paths(
+                pr.repo, req.symbol, pr.head_sha, self.cfg.review.referenced_search_limit)
+        except GitError:
+            return None
+        path = next((h for h in hits if is_test_like_path(h)), None)
+        if not path:
+            return None
+        try:
+            text = self.gitrepo.show(pr.repo, pr.head_sha, path)
+        except GitError:
+            return None
+        got = extract_symbol_snippet(text, req.symbol)
+        if not got:
+            return None
+        return ReferencedSnippet(symbol=req.symbol, path=path, text=got[0], kind="test")
+
     def _resolve_symbol(self, pr: PullRequest, req) -> ReferencedSnippet | None:
-        """Resolve one ContextRequest to a ReferencedSnippet, or None. Hybrid: try the
-        module hint's path, else code search; fetch at the head SHA; slice the definition.
+        """Resolve one ContextRequest to a ReferencedSnippet, or None. Tries the local
+        clone first (network-resilient, indexes the PR head); on any miss falls back to
+        the gh path: the module hint's path, else code search; fetch at the head SHA.
         Every ``gh`` call is best-effort — a GhError just means the symbol is unresolved."""
         if getattr(req, "kind", "definition") == "tests":
             return self._resolve_tests(pr, req)
+        local = self._resolve_symbol_local(pr, req)
+        if local:
+            return local
         text, path = None, None
         for hint_path in module_path_candidates(req.module_hint):
             try:
@@ -331,7 +467,11 @@ class ReviewOrchestrator:
         """Resolve a kind="tests" request to an EXISTING test excerpt, or None. Skips
         the module hint (it points at the source, not its tests): code-search the symbol,
         pick the first test-like path, fetch at the head SHA. Best-effort — any GhError or
-        no test-like hit means the symbol joins the UNRESOLVED list."""
+        no test-like hit means the symbol joins the UNRESOLVED list. Tries the local clone
+        first (see ``_resolve_tests_local``); on a miss falls back to the gh path below."""
+        local = self._resolve_tests_local(pr, req)
+        if local:
+            return local
         try:
             hits = self.gh.search_code(pr.repo, req.symbol, self.cfg.review.referenced_search_limit)
         except GhError:
@@ -442,6 +582,7 @@ class ReviewOrchestrator:
 
         worker_usages: list[Usage] = []
         advisor_usages: list[Usage] = []
+        verifier_usages: list[Usage] = []
         lens_errors: list[str] = []
         coverages: list = []
         raw_findings: list = []
@@ -450,6 +591,10 @@ class ReviewOrchestrator:
         # definitions, so the scoring fallback is bounded by ONE chunk, never the full text.
         score_ctx: dict[str, tuple[str, str]] = {}
         default_ctx = (fd.text, "")
+
+        # The repo's own convention docs, fed only to the consistency lens + its scorer.
+        # Repo-level, so fetched once and reused across chunks (never per chunk).
+        conv_ctx = self._fetch_conventions(pr)
 
         if not chunks:
             # Fetch the real definitions of symbols the diff references but does not show,
@@ -460,7 +605,8 @@ class ReviewOrchestrator:
                 user_prompt = build_user_prompt(pr, fd, prior_context=prior_ctx, referenced_context=ref_ctx)
 
             lens_results: list[LensResult] = self._map_parallel(
-                lenses, lambda ln: self._run_one_lens(ln, pr, fd, user_prompt, has_source, has_test)
+                lenses,
+                lambda ln: self._run_one_lens(ln, pr, fd, user_prompt, has_source, has_test, conv_ctx=conv_ctx),
             )
             worker_usages = [lr.usage for lr in lens_results]
             advisor_usages = list(ref_usages)
@@ -483,7 +629,7 @@ class ReviewOrchestrator:
                 lens_results = self._map_parallel(
                     lenses,
                     lambda ln, cfd=cfd, up=up, i=i: self._run_one_lens(
-                        ln, pr, cfd, up, has_source, has_test, agent_suffix=f"·c{i}"
+                        ln, pr, cfd, up, has_source, has_test, agent_suffix=f"·c{i}", conv_ctx=conv_ctx
                     ),
                 )
                 worker_usages += [lr.usage for lr in lens_results]
@@ -503,8 +649,8 @@ class ReviewOrchestrator:
 
         # Every call failed → record error (cost still counted), do not post.
         if failed_calls == total_calls:
-            worker_u, advisor_u = self._provider_usage(worker_usages, advisor_usages)
-            cost = self._split_cost(worker_usages, advisor_usages)
+            worker_u, advisor_u = self._provider_usage(worker_usages, advisor_usages, verifier_usages)
+            cost = self._split_cost(worker_usages, advisor_usages, verifier_usages)
             if not dry_run:
                 self.store.record(
                     pr.repo, pr.number, pr.head_sha, ACTION_ERROR,
@@ -522,13 +668,25 @@ class ReviewOrchestrator:
         survivors: list = []
         scored_total = 0
         if findings:
+            # Agentic scoring: one PR-head worktree, created once here (main thread,
+            # only when there are findings to score) and torn down after the fan-out.
+            wt_dir = self._agentic_worktree(pr)
+            self._scoring_agentic = wt_dir is not None  # drives the TUI model tag on score:*
+
             def _score(f):
                 ctext, rctx = score_ctx.get(f.file.strip(), default_ctx)
-                return self._score_finding(f, pr, replace(fd, text=ctext), rc.scoring_votes, prior_ctx, rctx)
+                return self._score_finding(
+                    f, pr, replace(fd, text=ctext), rc.scoring_votes, prior_ctx, rctx, conv_ctx,
+                    worktree_dir=wt_dir,
+                )
 
-            scored = self._map_parallel(findings, _score)
-            for f, conf, reason, score_usages in scored:
-                advisor_usages.extend(score_usages)
+            try:
+                scored = self._map_parallel(findings, _score)
+            finally:
+                if wt_dir:
+                    self.gitrepo.remove_worktree(pr.repo, wt_dir)  # best-effort, main thread
+            for f, conf, reason, score_usages, was_agentic in scored:
+                (verifier_usages if was_agentic else advisor_usages).extend(score_usages)
                 if conf is None:
                     # Scoring failed entirely (not even a dropped-count entry) — an
                     # anomaly worth surfacing, unlike a merely below-bar score.
@@ -554,8 +712,8 @@ class ReviewOrchestrator:
             survivors.sort(key=lambda f: (_SEV_RANK.get(f.severity, 9), f.id))
 
         latency_s = time.monotonic() - t0
-        worker_u, advisor_u = self._provider_usage(worker_usages, advisor_usages)
-        cost = self._split_cost(worker_usages, advisor_usages)
+        worker_u, advisor_u = self._provider_usage(worker_usages, advisor_usages, verifier_usages)
+        cost = self._split_cost(worker_usages, advisor_usages, verifier_usages)
         content = synthesize_markdown(
             survivors, coverage, lens_errors=lens_errors,
             scored_total=scored_total, threshold=rc.confidence_threshold,
@@ -595,20 +753,26 @@ class ReviewOrchestrator:
         )
         return ReviewOutcome(ACTION_REVIEW, cost_usd=cost, comment_url=url)
 
-    def _provider_usage(self, worker_usages, advisor_usages):
-        """Split usage by real provider. When there is no DISTINCT advisor (advisor IS
-        the worker), planner+scoring tokens are the worker's — fold them in and report
-        zero advisor usage, so a DeepSeek-only review shows no phantom advisor tokens."""
+    def _provider_usage(self, worker_usages, advisor_usages, verifier_usages=()):
+        """Split usage into the (worker, non-worker) columns the DB/TUI track. The
+        agentic verifier is always a DISTINCT provider (a claude/GLM CLI, never the
+        DeepSeek worker), so its tokens go in the non-worker column. When there is no
+        distinct ADVISOR (advisor IS the worker), planner+scoring tokens fold into the
+        worker column — a DeepSeek-only review then shows verifier tokens (if any) as the
+        only non-worker usage, and zero phantom advisor tokens."""
+        verifier_usages = list(verifier_usages)
         if self.advisor is self.deepseek:
-            return merge_usages(worker_usages + advisor_usages), Usage()
-        return merge_usages(worker_usages), merge_usages(advisor_usages)
+            return merge_usages(list(worker_usages) + list(advisor_usages)), merge_usages(verifier_usages)
+        return merge_usages(list(worker_usages)), merge_usages(list(advisor_usages) + verifier_usages)
 
-    def _split_cost(self, worker_usages, advisor_usages) -> float:
+    def _split_cost(self, worker_usages, advisor_usages, verifier_usages=()) -> float:
         """Bill each provider's usage at its own price. When advisor IS the worker
-        (default), both prices are deepseek's → identical to a single-price total."""
+        (default), both prices are deepseek's → identical to a single-price total; the
+        verifier is billed at its own prices (default 0/0 → $0)."""
         return (
             estimate_cost_usd(merge_usages(worker_usages), self.worker_prices)
             + estimate_cost_usd(merge_usages(advisor_usages), self.advisor_prices)
+            + estimate_cost_usd(merge_usages(list(verifier_usages)), self.verifier_prices)
         )
 
     def _lens_overhead_tokens(self, pr, fd, lenses, prior_ctx: str) -> int:
@@ -638,23 +802,32 @@ class ReviewOrchestrator:
         kind: scorers (``score:*``) and the planner (``context``) run on the advisor;
         lenses run on the worker."""
         if self.bus:
-            model = (
-                self.advisor.model
-                if (agent.startswith("score") or agent.startswith("context"))
-                else self.deepseek.model
-            )
+            if agent.startswith("score"):
+                # Scoring runs on the verifier when agentic is active this review, else the advisor.
+                model = self.verifier.model if (self._scoring_agentic and self.verifier) else self.advisor.model
+            elif agent.startswith("context"):
+                model = self.advisor.model
+            else:
+                model = self.deepseek.model
             self.bus.publish(AgentEvent(
                 repo=pr.repo, pr_number=pr.number, agent=agent, status=status,
                 detail=detail, title=pr.title, model=model,
             ))
 
     def _run_one_lens(self, lens: str, pr, fd, user_prompt: str, has_source: bool, has_test: bool,
-                      agent_suffix: str = "") -> LensResult:
+                      agent_suffix: str = "", conv_ctx: str = "") -> LensResult:
         # agent_suffix distinguishes per-chunk runs on the TUI agents board
         # (keyed by name — unsuffixed chunk runs would overwrite each other).
         agent = f"lens:{lens}{agent_suffix}"
         self._emit_agent(pr, agent, "running")
-        up = user_prompt + coverage_hint(has_source, has_test) if lens == "test_coverage" else user_prompt
+        # Per-lens context appendix: coverage signal for test_coverage, the repo's own
+        # convention docs for consistency; the other 3 lenses get the bare user prompt.
+        if lens == "test_coverage":
+            up = user_prompt + coverage_hint(has_source, has_test)
+        elif lens == "consistency":
+            up = user_prompt + conventions_block(conv_ctx)
+        else:
+            up = user_prompt
         t0 = time.monotonic()
         try:
             res = self.deepseek.review(LENS_PROMPTS[lens], up)
@@ -673,20 +846,39 @@ class ReviewOrchestrator:
         )
         return LensResult(lens=lens, findings=tuple(found), usage=res.usage, ok=True, raw=res.content, coverage=coverage)
 
-    def _score_finding(self, finding, pr, fd, votes: int, prior_ctx: str = "", referenced_ctx: str = ""):
+    def _score_finding(self, finding, pr, fd, votes: int, prior_ctx: str = "", referenced_ctx: str = "",
+                       conventions_ctx: str = "", worktree_dir: str | None = None):
         """Score one finding with ``votes`` independent calls; return
-        ``(finding, median_confidence|None, reason, [usages])``. ``prior_ctx`` lets
-        the scorer return 0 for a finding already raised in the PR's discussion;
-        ``referenced_ctx`` supplies the fetched definitions it scores against."""
+        ``(finding, median_confidence|None, reason, [usages], was_agentic)``. ``prior_ctx``
+        lets the scorer return 0 for a finding already raised in the PR's discussion;
+        ``referenced_ctx`` supplies the fetched definitions it scores against.
+        Consistency-lens findings score against a DIFFERENT prompt (the default scorer
+        caps style at 25, which would kill them) and see the ``conventions_ctx`` block.
+        When ``worktree_dir`` is set (agentic scoring, non-consistency findings only), each
+        vote is a ``claude -p`` run with read-only tools inside that PR-head checkout — it
+        reads the real code instead of guessing. ``was_agentic`` tells the caller which
+        usage bucket the tokens belong to; it is False when the agentic votes all failed
+        and a single non-agentic advisor vote was used as the fallback."""
         agent = f"score:#{finding.id}"
         self._emit_agent(pr, agent, "running", f"{finding.severity} {finding.file}")
-        user = build_scoring_user_prompt(pr, fd, finding, prior_context=prior_ctx, referenced_context=referenced_ctx)
+        is_consistency = finding.lens == "consistency"
+        agentic = worktree_dir is not None and self.verifier is not None and not is_consistency
+        scoring_prompt = (
+            AGENTIC_SCORING_SYSTEM_PROMPT if agentic
+            else CONSISTENCY_SCORING_SYSTEM_PROMPT if is_consistency
+            else SCORING_SYSTEM_PROMPT
+        )
+        user = build_scoring_user_prompt(
+            pr, fd, finding, prior_context=prior_ctx, referenced_context=referenced_ctx,
+            conventions_context=conventions_ctx if is_consistency else "",
+        )
         confs: list[int] = []
         reason = ""
         usages: list[Usage] = []
         for _ in range(votes):
             try:
-                res = self.advisor.review(SCORING_SYSTEM_PROMPT, user)
+                res = (self.verifier.verify(scoring_prompt, user, cwd=worktree_dir)
+                       if agentic else self.advisor.review(scoring_prompt, user))
             except DeepSeekError:
                 continue
             usages.append(res.usage)
@@ -694,12 +886,28 @@ class ReviewOrchestrator:
             if parsed is not None:
                 confs.append(parsed[0])
                 reason = reason or parsed[1]
+        was_agentic = agentic
+        if agentic and not confs:
+            # Every agentic vote failed (GLM flaked / unparseable) — one plain advisor vote
+            # so a finding degrades to today's scorer instead of vanishing as "unscored".
+            # ponytail: usages now mixes any stray verifier tokens with the advisor's; both
+            # bill at ~$0, so the whole finding buckets to advisor (was_agentic False).
+            was_agentic = False
+            try:
+                res = self.advisor.review(SCORING_SYSTEM_PROMPT, user)
+                usages.append(res.usage)
+                parsed = parse_score(res.content)
+                if parsed is not None:
+                    confs.append(parsed[0])
+                    reason = reason or parsed[1]
+            except DeepSeekError:
+                pass
         conf = int(round(statistics.median(confs))) if confs else None
         self._emit_agent(
             pr, agent, "done" if conf is not None else "failed",
             f"confidence {conf}" if conf is not None else "no score",
         )
-        return finding, conf, reason, usages
+        return finding, conf, reason, usages, was_agentic
 
     # -- guardrail handlers ---------------------------------------------
     def _handle_oversized(self, pr: PullRequest, ts: str, detail: str) -> ReviewOutcome:

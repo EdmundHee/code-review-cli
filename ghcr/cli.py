@@ -12,6 +12,7 @@ from .config import Config, ConfigError, load_config
 from .claude_cli import ClaudeCliClient
 from .deepseek import DeepSeekClient
 from .github import GhClient, GhError
+from .gitrepo import GitRepoCache
 from .poller import PollLoop, baseline_if_first_run, preflight
 from .review import ReviewOrchestrator
 from .state import StateStore
@@ -43,6 +44,8 @@ def _build(cfg: Config, bus=None):
             model=cfg.claude.model,
             timeout=cfg.claude.request_timeout_seconds,
             prices=cfg.claude.prices,
+            base_url=cfg.claude.base_url,
+            auth_token=cfg.claude.api_key,
         )
     elif cfg.review.advisor_provider == "openai":
         # Generic OpenAI-compatible advisor (e.g. GLM-5.2 via a Z.ai subscription).
@@ -55,8 +58,27 @@ def _build(cfg: Config, bus=None):
             send_thinking_extra_body=cfg.advisor.send_thinking_extra_body,
         )
         advisor.prices = cfg.advisor.prices  # _split_cost / advisor_prices read .prices
+    # Local-clone symbol resolution (ctor does no I/O; the hot review.local_checkout
+    # flag gates use). Restart-only: git_path/repos_dir bind here at startup.
+    gitrepo = GitRepoCache(
+        cfg.github.git_path, cfg.github.token, cfg.repos_dir,
+        timeout=cfg.github.request_timeout_seconds,
+    )
+    # Agentic scoring verifier (claude -p + read-only tools in a PR-head worktree).
+    # Built only when enabled; the hot review.agentic_scoring flag gates use, but the
+    # client binds here at startup (restart to switch on from cold).
+    verifier = None
+    if cfg.review.agentic_scoring and cfg.claude is not None:
+        verifier = ClaudeCliClient(
+            claude_path=cfg.claude.claude_path,
+            model=cfg.claude.model,
+            timeout=cfg.claude.request_timeout_seconds,
+            prices=cfg.claude.prices,
+            base_url=cfg.claude.base_url,
+            auth_token=cfg.claude.api_key,
+        )
     store = StateStore(cfg.db_path)
-    orch = ReviewOrchestrator(gh, ds, store, cfg, bus=bus, advisor=advisor)
+    orch = ReviewOrchestrator(gh, ds, store, cfg, bus=bus, advisor=advisor, gitrepo=gitrepo, verifier=verifier)
     return gh, ds, store, orch
 
 

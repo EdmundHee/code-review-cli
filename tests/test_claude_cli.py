@@ -2,7 +2,12 @@ import json
 import subprocess
 import pytest
 
-from ghcr.claude_cli import ClaudeCliClient, ClaudeCliError, build_claude_argv
+from ghcr.claude_cli import (
+    ClaudeCliClient,
+    ClaudeCliError,
+    build_claude_agentic_argv,
+    build_claude_argv,
+)
 from ghcr.deepseek import DeepSeekError
 from ghcr.cost import Prices
 
@@ -17,8 +22,22 @@ def test_build_claude_argv_has_expected_flags():
     assert argv[argv.index("--disallowedTools") + 1] == "*"
 
 
+def test_build_agentic_argv_enables_readonly_tools_no_wildcard_deny():
+    argv = build_claude_agentic_argv("/bin/claude", "glm-4.7", "SYS")
+    assert argv[argv.index("--model") + 1] == "glm-4.7"
+    assert argv[argv.index("--output-format") + 1] == "json"
+    assert argv[argv.index("--allowedTools") + 1] == "Read,Grep,Glob"
+    # never the pure-text-generator wildcard deny (would starve the tool loop)
+    disallowed = argv[argv.index("--disallowedTools") + 1]
+    assert disallowed != "*"
+    for t in ("Bash", "Edit", "Write"):
+        assert t in disallowed
+    # a reviewed repo's own .claude/ must not configure the verifier
+    assert argv[argv.index("--setting-sources") + 1] == "user"
+
+
 def _fake_run(stdout, returncode=0, stderr=""):
-    def run(argv, input=None, capture_output=True, text=True, timeout=None):
+    def run(argv, input=None, capture_output=True, text=True, timeout=None, env=None, cwd=None):
         return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)
     return run
 
@@ -127,3 +146,49 @@ def test_timeout_raises_claude_error(monkeypatch):
     c = ClaudeCliClient(claude_path="/bin/claude", model="opus")
     with pytest.raises(ClaudeCliError):
         c.review("sys", "user")
+
+
+def _capturing_run(seen, stdout, returncode=0, stderr=""):
+    def run(argv, input=None, capture_output=True, text=True, timeout=None, env=None, cwd=None):
+        seen["argv"] = argv
+        seen["env"] = env
+        seen["cwd"] = cwd
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)
+    return run
+
+
+def test_verify_passes_cwd_and_agentic_argv(monkeypatch):
+    seen = {}
+    payload = json.dumps({"result": '{"confidence": 90, "reason": "read the code"}',
+                          "usage": {"input_tokens": 10, "output_tokens": 5}})
+    monkeypatch.setattr(subprocess, "run", _capturing_run(seen, payload))
+    c = ClaudeCliClient(claude_path="/bin/claude", model="glm-4.7")
+    r = c.verify("sys", "user", cwd="/tmp/wt")
+    assert seen["cwd"] == "/tmp/wt"
+    assert "--allowedTools" in seen["argv"]
+    assert "90" in r.content
+    assert seen["env"] is None  # no override → inherit (subscription auth)
+
+
+def test_verify_env_carries_base_url_and_token_not_argv(monkeypatch):
+    seen = {}
+    payload = json.dumps({"result": "ok", "usage": {"input_tokens": 1, "output_tokens": 1}})
+    monkeypatch.setattr(subprocess, "run", _capturing_run(seen, payload))
+    c = ClaudeCliClient(claude_path="/bin/claude", model="glm-4.7",
+                        base_url="https://api.z.ai/api/anthropic", auth_token="ZSECRET")
+    c.verify("sys", "user", cwd="/tmp/wt")
+    assert seen["env"]["ANTHROPIC_BASE_URL"] == "https://api.z.ai/api/anthropic"
+    assert seen["env"]["ANTHROPIC_AUTH_TOKEN"] == "ZSECRET"
+    assert "ZSECRET" not in " ".join(seen["argv"])  # never in argv
+
+
+def test_verify_scrubs_token_from_error(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(subprocess, "run",
+                        _capturing_run(seen, "", returncode=1, stderr="auth failed for ZSECRET"))
+    c = ClaudeCliClient(claude_path="/bin/claude", model="glm-4.7",
+                        base_url="https://api.z.ai/api/anthropic", auth_token="ZSECRET")
+    with pytest.raises(ClaudeCliError) as ei:
+        c.verify("sys", "user", cwd="/tmp/wt")
+    assert "ZSECRET" not in str(ei.value)
+    assert "***" in str(ei.value)

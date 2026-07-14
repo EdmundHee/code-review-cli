@@ -62,6 +62,7 @@ class GithubConfig:
     token: str
     bot_login: str
     request_timeout_seconds: int
+    git_path: str = "git"  # local-clone symbol resolution (restart-only)
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,10 @@ class ClaudeConfig:
     model: str
     request_timeout_seconds: int
     prices: Prices  # default 0/0 → subscription is flat, report $0
+    # Optional Anthropic-compatible endpoint override (e.g. GLM via Z.ai). Empty →
+    # the CLI's own subscription auth. Passed to the child env, never argv.
+    base_url: str = ""
+    api_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -130,6 +135,10 @@ class ReviewModeConfig:
     referenced_context_max_chars: int = 6000  # budget for the rendered referenced-defs block
     referenced_search_limit: int = 5  # code-search results scanned per unresolved symbol
     advisor_provider: str = "deepseek"  # "deepseek" | "claude" (Opus CLI) | "openai" (GLM etc.)
+    agentic_scoring: bool = False  # multi: score findings via `claude -p` with Read/Grep/Glob in a PR-head worktree
+    local_checkout: bool = True  # resolve symbols from a local shallow clone of the PR head; gh is the fallback
+    fetch_conventions: bool = True  # feed the repo's own CLAUDE.md etc. to the consistency lens
+    conventions_max_chars: int = 6000  # budget for the rendered ## CONVENTIONS block
 
 
 @dataclass(frozen=True)
@@ -150,6 +159,7 @@ class Config:
     review: ReviewModeConfig
     db_path: str
     log_level: str
+    repos_dir: str = "~/.local/state/ghcr/repos"  # bare-clone cache for local symbol resolution
     claude: "ClaudeConfig | None" = None
     advisor: "AdvisorConfig | None" = None
 
@@ -160,9 +170,11 @@ class Config:
 # (nothing re-runs setLevel on reload), so all of them need a restart to take effect.
 # NOTE: review.advisor_provider is hot-reloadable as a value, but the advisor
 # CLIENT is constructed at startup (cli._build) — flipping deepseek<->claude
-# requires a restart to take effect.
+# requires a restart to take effect. Same for review.agentic_scoring: the verifier
+# client is built at startup, so the flag is a hot KILL-SWITCH (off stops using an
+# already-built verifier) but enabling it from cold needs a restart.
 _RELOADABLE = ("repos", "poll_interval_seconds", "review_policy", "diff", "budgets", "review")
-_RESTART_ONLY = ("github", "deepseek", "db_path", "log_level", "claude", "advisor")
+_RESTART_ONLY = ("github", "deepseek", "db_path", "log_level", "repos_dir", "claude", "advisor")
 
 
 def merge_reloadable(old: Config, new: Config) -> tuple[Config, list[str]]:
@@ -232,6 +244,10 @@ def _parse_review(review: dict) -> "ReviewModeConfig":
         referenced_context_max_chars=max(0, int(review.get("referenced_context_max_chars", 6000))),
         referenced_search_limit=max(1, int(review.get("referenced_search_limit", 5))),
         advisor_provider=advisor_provider,
+        agentic_scoring=bool(review.get("agentic_scoring", False)),
+        local_checkout=bool(review.get("local_checkout", True)),
+        fetch_conventions=bool(review.get("fetch_conventions", True)),
+        conventions_max_chars=max(0, int(review.get("conventions_max_chars", 6000))),
     )
 
 
@@ -310,6 +326,7 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
         token=token,
         bot_login=bot_login,
         request_timeout_seconds=int(gh.get("request_timeout_seconds", 60)),
+        git_path=gh.get("git_path", "git"),
     )
     deepseek_cfg = DeepSeekConfig(
         api_key=api_key,
@@ -355,9 +372,19 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
 
     review_cfg = _parse_review(review)
 
+    # The `claude:` block is shared by the advisor (advisor_provider == "claude") and
+    # the agentic verifier (review.agentic_scoring) — build it if either is on.
     claude_cfg = None
-    if review_cfg.advisor_provider == "claude":
+    if review_cfg.advisor_provider == "claude" or review_cfg.agentic_scoring:
         cprices_raw = claude_raw.get("prices", {}) or {}
+        claude_base_url = claude_raw.get("base_url", "")
+        # A base_url override needs a resolvable token; without an override the CLI's
+        # own subscription auth is used and no env var is required.
+        claude_api_key = (
+            _require_env(env, claude_raw.get("api_key_env", "ANTHROPIC_AUTH_TOKEN"), "claude api key")
+            if (claude_base_url and resolve_secrets)
+            else ""
+        )
         claude_cfg = ClaudeConfig(
             claude_path=claude_raw.get("claude_path", "claude"),
             model=claude_raw.get("model", "opus"),
@@ -366,6 +393,8 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
                 input_per_1m=float(cprices_raw.get("input_per_1m", 0.0)),
                 output_per_1m=float(cprices_raw.get("output_per_1m", 0.0)),
             ),
+            base_url=claude_base_url,
+            api_key=claude_api_key,
         )
 
     advisor_cfg = None
@@ -383,6 +412,7 @@ def load_config(path: str, env=None, resolve_secrets: bool = True) -> Config:
         review=review_cfg,
         db_path=os.path.expanduser(storage.get("db_path", "~/.local/state/ghcr/ghcr.db")),
         log_level=str(logging_cfg.get("level", "INFO")).upper(),
+        repos_dir=os.path.expanduser(storage.get("repos_dir", "~/.local/state/ghcr/repos")),
         claude=claude_cfg,
         advisor=advisor_cfg,
     )

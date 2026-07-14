@@ -1,4 +1,5 @@
 import dataclasses
+import os
 import textwrap
 
 import pytest
@@ -117,7 +118,11 @@ def test_review_defaults_to_multi(tmp_path):
     assert cfg.review.mode == "multi"
     assert cfg.review.confidence_threshold == 80
     assert cfg.review.scoring_votes == 1
-    assert set(cfg.review.lenses) == {"correctness", "security", "maintainability", "test_coverage"}
+    assert set(cfg.review.lenses) == {
+        "correctness", "security", "maintainability", "test_coverage", "consistency"
+    }
+    assert cfg.review.fetch_conventions is True
+    assert cfg.review.conventions_max_chars == 6000
     assert cfg.diff.test_globs  # defaults applied
 
 
@@ -201,6 +206,42 @@ def test_review_referenced_context_parsed_and_clamped(tmp_path):
     assert cfg.review.referenced_max_symbols == 0       # clamped >= 0
     assert cfg.review.referenced_context_max_chars == 0  # clamped >= 0
     assert cfg.review.referenced_search_limit == 1       # clamped >= 1
+
+
+# -- local checkout / git_path / repos_dir -----------------------------------
+
+def test_local_checkout_defaults(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID), env={}, resolve_secrets=False)
+    assert cfg.review.local_checkout is True          # on by default
+    assert cfg.github.git_path == "git"
+    assert cfg.repos_dir == os.path.expanduser("~/.local/state/ghcr/repos")
+
+
+def test_local_checkout_parsed(tmp_path):
+    text = VALID + "review:\n  local_checkout: false\n"
+    text = text.replace("gh_path: /opt/homebrew/bin/gh",
+                        "gh_path: /opt/homebrew/bin/gh\n  git_path: /usr/local/bin/git")
+    text += "storage:\n  repos_dir: ~/somewhere/repos\n"
+    cfg = load_config(_write(tmp_path, text), env={}, resolve_secrets=False)
+    assert cfg.review.local_checkout is False
+    assert cfg.github.git_path == "/usr/local/bin/git"
+    assert cfg.repos_dir == os.path.expanduser("~/somewhere/repos")
+
+
+def test_merge_reports_repos_dir_change_as_restart_only(tmp_path):
+    old = make_config(db_path=str(tmp_path / "db"), repos_dir=str(tmp_path / "r1"))
+    new = dataclasses.replace(old, repos_dir=str(tmp_path / "r2"))
+    merged, restart = merge_reloadable(old, new)
+    assert merged.repos_dir == str(tmp_path / "r1")   # kept from old
+    assert "repos_dir" in restart
+
+
+def test_merge_swaps_local_checkout_no_restart(tmp_path):
+    old = make_config(db_path=str(tmp_path / "db"))
+    new = dataclasses.replace(old, review=dataclasses.replace(old.review, local_checkout=False))
+    merged, restart = merge_reloadable(old, new)
+    assert merged.review.local_checkout is False      # review is hot-reloadable
+    assert restart == []
 
 
 # -- merge_reloadable (hot-reload) -------------------------------------------
@@ -314,3 +355,56 @@ def test_merge_reports_claude_change_as_restart_only(tmp_path):
     # claude is restart-only: change is dropped from merged but reported
     assert merged.claude is None
     assert "claude" in restart
+
+
+def test_agentic_scoring_defaults_off(tmp_path):
+    cfg = load_config(_write(tmp_path, VALID), env={}, resolve_secrets=False)
+    assert cfg.review.agentic_scoring is False
+    assert cfg.claude is None  # no claude block built when neither advisor=claude nor agentic
+
+
+def test_agentic_scoring_builds_claude_block_without_advisor(tmp_path):
+    text = VALID + textwrap.dedent("""\
+        review:
+          agentic_scoring: true
+        claude:
+          model: glm-4.7
+        """)
+    cfg = load_config(_write(tmp_path, text), env={}, resolve_secrets=False)
+    assert cfg.review.agentic_scoring is True
+    assert cfg.claude is not None            # built even though advisor_provider stays deepseek
+    assert cfg.review.advisor_provider == "deepseek"
+    assert cfg.claude.model == "glm-4.7"
+
+
+def test_agentic_base_url_requires_token(tmp_path):
+    text = VALID + textwrap.dedent("""\
+        review:
+          agentic_scoring: true
+        claude:
+          model: glm-4.7
+          base_url: https://api.z.ai/api/anthropic
+          api_key_env: ZAI_API_KEY
+        """)
+    # base_url set but env var missing → fail fast
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, text), env={"GH_TOKEN": "x", "DEEPSEEK_API_KEY": "y"})
+    # with the token present it resolves
+    cfg = load_config(
+        _write(tmp_path, text),
+        env={"GH_TOKEN": "x", "DEEPSEEK_API_KEY": "y", "ZAI_API_KEY": "ztok"},
+    )
+    assert cfg.claude.base_url == "https://api.z.ai/api/anthropic"
+    assert cfg.claude.api_key == "ztok"
+
+
+def test_agentic_no_base_url_needs_no_token(tmp_path):
+    text = VALID + textwrap.dedent("""\
+        review:
+          agentic_scoring: true
+        claude:
+          model: glm-4.7
+        """)
+    cfg = load_config(_write(tmp_path, text), env={"GH_TOKEN": "x", "DEEPSEEK_API_KEY": "y"})
+    assert cfg.claude.base_url == ""
+    assert cfg.claude.api_key == ""  # subscription auth → no env var required

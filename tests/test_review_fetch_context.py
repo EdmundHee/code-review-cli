@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from ghcr.deepseek import DeepSeekError
 from ghcr.review import ReviewOrchestrator
 from ghcr.state import StateStore
-from tests.fakes import FakeDeepSeekClient, FakeGhClient, make_config, make_pr
+from tests.fakes import FakeDeepSeekClient, FakeGhClient, FakeGitRepoCache, make_config, make_pr
 
 FIXED = datetime(2026, 5, 29, 12, 0, tzinfo=timezone.utc)
 
@@ -55,11 +55,13 @@ def _responses(*, corr=CORR, sec=EMPTY, maint=EMPTY, cov=COV, score=SCORE, plann
     }
 
 
-def _orch(tmp_path, gh, ds, **cfg_kw):
+def _orch(tmp_path, gh, ds, gitrepo=None, **cfg_kw):
     cfg_kw.setdefault("fetch_referenced_context", True)
+    if gitrepo is not None:
+        cfg_kw.setdefault("local_checkout", True)
     cfg = make_config(db_path=str(tmp_path / "ghcr.db"), review_mode="multi", **cfg_kw)
     store = StateStore(cfg.db_path)
-    return ReviewOrchestrator(gh, ds, store, cfg, now=lambda: FIXED), store
+    return ReviewOrchestrator(gh, ds, store, cfg, now=lambda: FIXED, gitrepo=gitrepo), store
 
 
 def test_referenced_context_reaches_lens_and_scoring_prompts(tmp_path):
@@ -209,6 +211,100 @@ def test_kind_tests_no_test_like_hit_is_unresolved(tmp_path):
     for pass_key in ("## LENS: correctness", "## PASS: scoring"):
         users = ds.user_for(pass_key)
         assert users and all("UNRESOLVED" in u and "BaseConnector" in u for u in users)
+
+
+# -- local-clone resolution (gitrepo), with gh fallback ----------------------
+
+def test_local_hint_hit_resolves_without_gh(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"db/base.py": BASE_SRC})  # gh present but must go unused
+    git = FakeGitRepoCache(files={"db/base.py": BASE_SRC})
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds, gitrepo=git)
+    out = orch.review_pr(make_pr())
+    assert out.action == "review"
+    lens_users = ds.user_for("## LENS: correctness")
+    assert lens_users and any("lazy: reconnects" in u for u in lens_users)
+    assert gh.file_calls == 0 and gh.search_calls == 0  # local resolved it
+    assert git.ensure_calls == 1 and git.show_calls == 1
+
+
+def test_local_grep_hit_when_no_hint(tmp_path):
+    planner = '{"requests":[{"symbol":"BaseConnector","reason":"subclassed"}]}'  # no hint
+    gh = FakeGhClient(diff=SRC_DIFF)
+    git = FakeGitRepoCache(files={"db/base.py": BASE_SRC}, grep_hits={"BaseConnector": ["db/base.py"]})
+    ds = FakeDeepSeekClient(responses=_responses(planner=planner))
+    orch, store = _orch(tmp_path, gh, ds, gitrepo=git)
+    orch.review_pr(make_pr())
+    assert git.grep_calls == 1 and git.show_calls == 1
+    assert gh.file_calls == 0 and gh.search_calls == 0
+    assert any("class BaseConnector" in u for u in ds.user_for("## LENS: correctness"))
+
+
+def test_local_miss_falls_back_to_gh(tmp_path):
+    # local clone ready but the symbol isn't found there -> gh path resolves it
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"db/base.py": BASE_SRC})
+    git = FakeGitRepoCache(files={}, grep_hits={})  # empty checkout
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds, gitrepo=git)
+    out = orch.review_pr(make_pr())
+    assert out.action == "review"
+    assert gh.file_calls == 1  # gh fallback resolved it
+    assert any("lazy: reconnects" in u for u in ds.user_for("## LENS: correctness"))
+
+
+def test_ensure_failure_uses_gh_and_ensures_once(tmp_path):
+    # the incident regression: checkout unavailable -> every symbol via gh, ONE ensure
+    planner = (
+        '{"requests":['
+        '{"symbol":"A","module_hint":"db.a"},'
+        '{"symbol":"B","module_hint":"db.b"},'
+        '{"symbol":"C","module_hint":"db.c"}]}'
+    )
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"*": "class X:\n    pass\n"})
+    git = FakeGitRepoCache(ensure_ok=False)
+    ds = FakeDeepSeekClient(responses=_responses(planner=planner))
+    orch, store = _orch(tmp_path, gh, ds, gitrepo=git)
+    orch.review_pr(make_pr())
+    assert git.ensure_calls == 1  # memoized despite 3 symbols
+    assert git.show_calls == 0 and git.grep_calls == 0  # never read when unavailable
+    assert gh.file_calls == 3  # all three resolved via gh
+
+
+def test_local_checkout_disabled_skips_ensure(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"db/base.py": BASE_SRC})
+    git = FakeGitRepoCache(files={"db/base.py": BASE_SRC})
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds, gitrepo=git, local_checkout=False)
+    orch.review_pr(make_pr())
+    assert git.ensure_calls == 0  # local path never touched
+    assert gh.file_calls == 1  # gh resolved it
+
+
+def test_giterror_mid_resolution_falls_back_to_gh(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF, file_contents={"db/base.py": BASE_SRC})
+    git = FakeGitRepoCache(files={"db/base.py": BASE_SRC}, raises=True)  # show/grep raise GitError
+    ds = FakeDeepSeekClient(responses=_responses())
+    orch, store = _orch(tmp_path, gh, ds, gitrepo=git)
+    out = orch.review_pr(make_pr())
+    assert out.action == "review"
+    assert gh.file_calls == 1  # gh fallback carried it
+    assert any("lazy: reconnects" in u for u in ds.user_for("## LENS: correctness"))
+
+
+def test_kind_tests_resolved_locally(tmp_path):
+    gh = FakeGhClient(diff=SRC_DIFF)
+    git = FakeGitRepoCache(
+        files={"tests/test_base.py": TEST_SRC},
+        grep_hits={"BaseConnector": ["src/base.py", "tests/test_base.py"]},
+    )
+    ds = FakeDeepSeekClient(responses=_responses(planner=TESTS_PLANNER))
+    orch, store = _orch(tmp_path, gh, ds, gitrepo=git)
+    out = orch.review_pr(make_pr())
+    assert out.action == "review"
+    assert gh.search_calls == 0 and gh.file_calls == 0  # local grep + show
+    lens_users = ds.user_for("## LENS: correctness")
+    assert lens_users and all("EXISTING TEST" in u for u in lens_users)
+    assert any("test_close_reconnects" in u for u in lens_users)
 
 
 def _orch_with_bus(tmp_path, gh, ds, **cfg_kw):

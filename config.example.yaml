@@ -3,6 +3,7 @@
 
 github:
   gh_path: /opt/homebrew/bin/gh      # ABSOLUTE path — bypasses shell shims/aliases
+  git_path: git                       # git binary for local-clone symbol resolution (restart-only)
   token_env: GH_TOKEN                 # daemon reads the bot PAT from this env var
   bot_login: edmundhee-reviewbot      # the bot's REAL username (no [bot] suffix)
   request_timeout_seconds: 60
@@ -76,6 +77,17 @@ review:
     - security
     - maintainability
     - test_coverage
+    - consistency                     # convention/consistency findings the bug lenses drop
+                                      # (divergent siblings, half-applied fixes, violations of
+                                      # the repo's own CLAUDE.md); scored by a dedicated pass
+                                      # that does NOT cap style at 25. Fed the repo's own docs
+                                      # (see fetch_conventions). Drop it to skip this class.
+  fetch_conventions: true             # read the target repo's own CLAUDE.md/CONTRIBUTING.md/
+                                      # AGENTS.md at the PR head and feed them to the consistency
+                                      # lens as authoritative convention rules (local-clone-first,
+                                      # gh fallback, best-effort). Only fires when the consistency
+                                      # lens is enabled. false to skip the fetch.
+  conventions_max_chars: 6000         # budget for the rendered ## CONVENTIONS block
   max_parallel: 0                     # cap concurrent model calls; 0 = unbounded
   read_prior_comments: true           # feed the PR's existing comments (bot + human,
                                       # timeline + inline) back as context, and let the
@@ -83,6 +95,11 @@ review:
   prior_comment_max_chars: 6000       # budget for the rendered prior-discussion block
   rereview_on_mention: true           # a new comment that @mentions the bot triggers a fresh
                                       # full review (no new commit needed). false to disable.
+  local_checkout: true                # resolve referenced symbols from a local shallow clone of the
+                                      # PR head (one `git fetch pull/N/head` per review, then all
+                                      # reads/greps are local — network-resilient AND indexes the PR
+                                      # head, unlike `gh search code`). Falls back to gh per-symbol on
+                                      # any miss/failure. false = gh-only (the old behavior).
   advisor_provider: deepseek          # who runs the planner + scoring passes. Lenses always
                                       # stay on DeepSeek; only these two passes move. Restart to apply.
                                       #   deepseek — default; DeepSeek does everything (no extra block).
@@ -94,15 +111,28 @@ review:
                                       #              its api_key_env exported.
                                       # claude/openai both give cross-model verification (a different
                                       # model refutes the finding than raised it) + lower DeepSeek spend.
+  agentic_scoring: false              # multi: run the scoring pass as `claude -p` WITH Read/Grep/Glob
+                                      # inside a worktree of the PR head, so the verifier reads the REAL
+                                      # code to confirm/refute a finding instead of guessing from a diff
+                                      # snippet. Uses the `claude:` block below (point it at GLM via Z.ai
+                                      # for a flat-subscription, $0 verifier). Lenses stay on DeepSeek.
+                                      # Hot KILL-SWITCH (off stops using it); enabling from cold needs a
+                                      # restart. Best-effort: no worktree / a failed run → prompt-only
+                                      # scoring. With this on, scoring_votes: 1 is plenty (each vote is a
+                                      # slow multi-turn CLI run).
 
-# Only used when review.advisor_provider: claude. Auth comes from the Claude CLI's own
-# login (a subscription), NOT an API key — run `claude` once interactively to log in.
+# Used by review.advisor_provider: claude AND review.agentic_scoring (shared block). Auth is the
+# Claude CLI's own login (a subscription) — run `claude` once interactively — UNLESS base_url is set,
+# which points the CLI at an Anthropic-compatible endpoint (e.g. GLM via Z.ai) using api_key_env.
 claude:
   claude_path: claude                 # path to the Claude Code CLI (on PATH by default)
-  model: opus                         # model alias passed to `claude -p --model`
-  request_timeout_seconds: 600
+  model: opus                         # model alias passed to `claude -p --model` (e.g. glm-4.7 for Z.ai)
+  request_timeout_seconds: 600        # per call; agentic verify() runs are multi-turn — consider 900+
+  # base_url: https://api.z.ai/api/anthropic   # Anthropic-compatible endpoint override. Omit → Claude
+  #                                             # subscription auth. Sent via env, never argv.
+  # api_key_env: ZAI_API_KEY          # NAME of the env var with the endpoint token (required iff base_url)
   prices:                             # USD per 1M tokens — subscription is flat, so 0/0
-    input_per_1m: 0.0                 # → advisor passes are reported as $0 (budget never blocks)
+    input_per_1m: 0.0                 # → advisor/verifier passes are reported as $0 (budget never blocks)
     output_per_1m: 0.0
 
 # Only used when review.advisor_provider: openai. A generic OpenAI-compatible advisor
@@ -121,6 +151,8 @@ advisor:
 
 storage:
   db_path: ~/.local/state/ghcr/ghcr.db
+  repos_dir: ~/.local/state/ghcr/repos   # bare-clone cache for review.local_checkout (restart-only).
+                                          # Grows per reviewed head; safe to `rm -rf` to reclaim disk.
 
 logging:
   level: INFO

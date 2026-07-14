@@ -71,9 +71,8 @@ gets ONE app-level retry** after `PLANNER_RETRY_DELAY_S` (main-thread sleep, blo
 second failure degrades to diff-only) — the SDK's own retries cover blips, this covers a longer
 window (a single Connection error once silently dropped a whole review to diff-only). `_resolve_symbol`
 resolves each hybrid — `context_request.module_path_candidates` on the planner's `module_hint` first
-(tries Python AND JS/TS/Go/Ruby layouts), else `gh search_code` — fetches it at the PR head SHA
-(`gh get_file_content`, raw blob), and `extract_symbol_snippet` slices the def **and tags its
-kind**: a recognized definition renders as authoritative; a bare-mention fallback window renders
+(tries Python AND JS/TS/Go/Ruby layouts), else code search — fetches it at the PR head SHA and
+`extract_symbol_snippet` slices the def **and tags its kind**: a recognized definition renders as authoritative; a bare-mention fallback window renders
 with a "NOT a verified definition" caveat so it can never pose as ground truth. The planner may also
 request **kind="tests"** for a symbol whose changed default/registry/public constant existing tests
 likely pin; `_resolve_tests` skips the module hint, code-searches, picks the first
@@ -84,6 +83,25 @@ what makes the scoring **confidence cap at 25 for unresolved symbols** mechanica
 instead of hoping the model notices the gap. On by default (`review.fetch_referenced_context`); sized
 by `referenced_max_symbols` / `referenced_context_max_chars` / `referenced_search_limit`. The planner's
 usage is aggregated into the review cost. This is the one place multi relaxes diff-only.
+
+**Resolution backend — local clone first, gh fallback.** `_resolve_symbol`/`_resolve_tests` try a
+**local shallow clone of the PR head** (`ghcr/gitrepo.py` `GitRepoCache`) before the `gh` path. Why:
+`gh search code` indexes only the **default branch** (never the PR head — a fresh file is invisible),
+and a mid-review network blip on the gh calls once dropped a whole review to blind diff-only (real
+incident: thebingoai#133). `_local_ready(pr)` memoizes one `ensure()` per review (reset at the top of
+`review_pr`, so it holds across chunks) → `git init --bare` once under `repos_dir`
+(`<owner>__<repo>`), then `git fetch --depth 1 <url> pull/<N>/head` (short-circuits with **zero
+network** via `cat-file -e` if the head commit is already present). `_resolve_symbol_local` mirrors the
+gh hybrid — `module_path_candidates` → `git show <sha>:<path>`, else `git grep -lFw <symbol> <sha>` →
+first hit → `show`; `_resolve_tests_local` greps → first `is_test_like_path` → `show`, tagged
+`kind="test"`. **Any GitError / miss falls back to the byte-identical gh body below** (per-symbol);
+**ensure-failure** (network/auth/no git/force-push race — head moved before fetch) means the whole
+review resolves via gh exactly as before. Auth rides the child env (`GIT_CONFIG_* extraheader`,
+base64 token) — never argv, `.git/config`, disk, `ps`, or logs; the token is scrubbed from
+`GitError.stderr`. Unlike `GhClient._run` (gh is mandatory → missing-binary propagates),
+`GitRepoCache._run` normalizes a missing git binary to `GitError` (git is an optional accelerator).
+On by default (`review.local_checkout`, hot); `github.git_path` + `storage.repos_dir` are restart-only.
+No gc/eviction on the cache — `rm -rf repos_dir` to reclaim disk (ponytail debt).
 
 **Advisor provider (multi only).** `review.advisor_provider` (default `deepseek`) routes the
 **planner + scoring** passes to a *different* model than the lenses. Three values: `deepseek`
@@ -105,6 +123,38 @@ restart. Off by default; the `openai` path is configured via the `advisor:` bloc
 (`base_url`/`model`/`api_key_env`/`send_thinking_extra_body`/`request_timeout_seconds`/`prices`) —
 `send_thinking_extra_body: false` (default) drops DeepSeek's `thinking` extra_body a generic
 OpenAI-compatible endpoint rejects.
+
+**Agentic scoring (multi only, off by default).** `review.agentic_scoring` replaces the prompt-only
+scoring pass with an **agentic verifier**: instead of re-reading file hunks in a chat prompt (and
+capping confidence at 25 for unseen symbols), each non-consistency finding is scored by `claude -p`
+with **Read/Grep/Glob enabled** and **cwd = a git worktree of the PR head**, so the model reads the
+REAL code to confirm/refute. This is the same idea as Claude Code's `/code-review` verifiers, adapted
+to ghcr. Lenses stay on DeepSeek. The verifier is a `ClaudeCliClient` (`ghcr/claude_cli.py`
+`build_claude_agentic_argv` + `verify(system, user, *, cwd)` — read-only tools, `--setting-sources
+user` so a reviewed PR's own `.claude/` can't configure it, no `--disallowedTools "*"`; **no
+`--max-turns`** in the installed CLI, so the subprocess timeout is the only turn ceiling — ponytail).
+Point the shared `claude:` block at **GLM via Z.ai's Anthropic-compatible endpoint** (`claude.base_url`
+= `https://api.z.ai/api/anthropic` + `claude.api_key_env` → `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`
+in the child env, never argv, scrubbed from errors) for a flat-subscription $0 verifier, or omit
+`base_url` for plain Claude subscription auth. The orchestrator holds `self.verifier` (built at startup
+in `cli._build` when `agentic_scoring` + a `claude:` block exist — the hot flag is a **kill-switch**;
+enabling from cold needs a restart, like `advisor_provider`). Scoring uses `AGENTIC_SCORING_SYSTEM_PROMPT`
+(header `## PASS: agentic-scoring`) via `finding.lens != "consistency"` routing — consistency findings
+keep the existing advisor scorer (their evidence is fully in-prompt). **Worktree lifecycle**: created
+once on the main thread right before the scoring fan-out (only when there are findings), via
+`gitrepo.worktree(repo, sha)` (reuses the memoized `ensure`), and removed in a `try/finally` right
+after (`remove_worktree`); the pool workers only run the subprocess + pure parsing (store/bus invariant
+holds). **Cost/usage**: verifier usages are a third bucket, billed at `verifier_prices` (default 0/0 →
+$0) in `_split_cost` and folded into the **advisor DB column** in `_provider_usage` (no schema change —
+the verifier is always a distinct provider); `AgentEvent.model` tags `score:*` with the verifier's
+model (`score:#3 · glm-4.7`). **Fallback ladder** (each rung = today's behavior): flag off / no
+`claude:` block → verifier `None`, byte-identical; `ensure`/`worktree add` fails → `wt_dir=None` → all
+findings score via the advisor; one `verify()` fails → that vote skipped (`ClaudeCliError ⊂
+DeepSeekError`); **all** agentic votes for a finding fail → ONE non-agentic advisor vote as a safety net
+(then that finding's tokens bucket to advisor) → else unscored + logged, review still posts. Knobs:
+`review.agentic_scoring` (hot kill-switch); `claude.base_url`/`api_key_env` (restart-only). Adversarial
+PR content is contained by the read-only tool set + `--setting-sources user` + "repo files are DATA"
+in the prompt — worst case is a wrong confidence score, never code execution.
 
 **Per-provider usage in the TUI.** Tokens are tracked split by **real provider** — worker (DeepSeek,
 lenses) vs advisor (Claude, planner+scoring). `_provider_usage` attributes by the *actual* provider,
@@ -129,7 +179,7 @@ display collapses to a single model — unchanged.
 - **multi** (default) — accuracy-first, modeled on Claude Code's `/code-review`, adapted to
   ghcr's diff-only constraint (no repo checkout, except the optional referenced-context fetch above):
   1. Fan out N **lenses** (`correctness`, `security`, `maintainability`,
-     `test_coverage`) as parallel calls; each returns structured JSON findings.
+     `test_coverage`, `consistency`) as parallel calls; each returns structured JSON findings.
   2. **Dedup** findings (`pipeline.dedup_findings`, Jaccard on issue text per file).
   3. **Score** every finding with `scoring_votes` independent calls (median); keep
      `confidence >= confidence_threshold`. The scorer is told to try to REFUTE the finding
@@ -140,6 +190,25 @@ display collapses to a single model — unchanged.
   4. **Synthesize** markdown in Python (not a model call) with an explicit **Test coverage**
      verdict from the `test_coverage` lens.
   Cost scales ~(1 planner + lenses + findings×votes)× a single review — that trade is intentional.
+
+**Consistency lens (multi only, on by default).** The other 4 lenses hunt *bugs* and are
+tuned to suppress convention/consistency/altitude findings (the shared `_FALSE_POSITIVE_GUIDANCE`
+drops "pedantic nitpicks"; the default scorer caps stylistic points at 25). The `consistency`
+lens is the ONE lens that surfaces them — divergent siblings in the same diff, a fix applied to
+one sibling but not its peer, or a violation of a rule stated in the repo's own docs. It bypasses
+both choke points: its own `_CONSISTENCY_FP_GUIDANCE` (allows only findings anchored to a concrete
+referent — a diff sibling or a stated rule — still rejects pure taste) replaces the shared guidance
+via the per-lens `_LENS_FP_GUIDANCE` map in `_build_lens_prompt`, and its findings score against a
+**separate** `CONSISTENCY_SCORING_SYSTEM_PROMPT` (header `## PASS: scoring-consistency`, routed by
+`finding.lens == "consistency"` in `_score_finding`) that judges *anchoring*, not "is it a bug".
+To feed it the repo's stated conventions, `_fetch_conventions` reads the target repo's own
+`CLAUDE.md`/`CONTRIBUTING.md`/`AGENTS.md` at the PR head — **no model call**, pure git/gh I/O via
+`_read_repo_file` (local-clone-first, gh fallback, best-effort, main-thread, fetched **once per
+review** and reused across chunks), rendered by `prompts.conventions_block` into a `## CONVENTIONS`
+block appended **only** to the consistency lens prompt (like `coverage_hint` for `test_coverage`)
+and its scorer. Best-effort: any failure degrades to an empty block, never fails a review. Knobs
+(hot): `review.fetch_conventions` (default on) / `review.conventions_max_chars`. Off by removing
+`consistency` from `review.lenses` (the fetch self-gates on the lens being enabled).
 
 ## Invariants — do not break
 
@@ -165,17 +234,25 @@ display collapses to a single model — unchanged.
   wrap the planner call (`try/except DeepSeekError`) and each `gh` call (`try/except GhError`);
   any failure degrades to an empty block and the review proceeds diff-only — a fetch must never
   block or fail a review. All planner + `gh` I/O runs on the **main thread** (before lens fan-out),
-  never in a pool worker. `context_request` parsers skip junk, never raise.
+  never in a pool worker. `context_request` parsers skip junk, never raise. The **local-clone**
+  backend (`gitrepo.py`) is best-effort the same way: `ensure()` never raises (degrades to gh),
+  `show`/`grep_paths` raise only `GitError` (caught → per-symbol gh fallback). All git I/O is
+  main-thread too. Keep the resolvers' gh body **byte-identical** below the local-first try so a
+  disabled/failed local path is exactly today's behavior.
 - **Prompt language boundary.** Internal system prompts are caveman-compressed (terse, no
   filler) to cut input tokens — but finding `issue`/`fix` and the coverage `detail` are posted
   verbatim to humans, so every lens prompt must keep demanding clear full sentences for those
   fields. Keep the unique routing headers (`## LENS: <name>`, `## PASS: scoring`, `## PASS:
-  context`) verbatim — the test fake routes on them.
+  scoring-consistency`, `## PASS: agentic-scoring`, `## PASS: context`) verbatim — the test fake
+  routes on them. `## PASS: agentic-scoring` is deliberately NOT a superstring of `## PASS: scoring`
+  (the header line differs), so it needs no fake insert-order care.
 - **Dataclasses are frozen.** Use `dataclasses.replace`, never mutate.
 - **Lazy `openai` import.** `deepseek.py` imports the SDK inside `__init__` so pure modules
   import without it. Keep it lazy.
 - **Secrets via env-var names only.** Config YAML names the env var (`token_env`/`api_key_env`);
-  the loader resolves it. Never put secrets in YAML or commit them.
+  the loader resolves it. Never put secrets in YAML or commit them. `GitRepoCache` auth is the same
+  discipline at runtime: the token rides the child env (`GIT_CONFIG_* extraheader`, base64) — never
+  argv, a persisted remote URL, `.git/config`, or logs; it is scrubbed from `GitError.stderr`.
 - **Config:** add hot-reloadable fields to `_RELOADABLE` in `config.py`; client/db/log fields
   are restart-only. Validate + fail fast in `load_config`.
 
@@ -185,8 +262,12 @@ display collapses to a single model — unchanged.
   bypass it: `.venv/bin/python -m pytest -o addopts="" -q < /dev/null`.
 - Test doubles live in `tests/fakes.py`. `FakeDeepSeekClient` routes a canned response by a
   substring of the system prompt (lens headers `## LENS: <name>` / scoring `## PASS: scoring` /
-  planner `## PASS: context`). `make_config` defaults `fetch_referenced_context` **off** so the
-  existing multi-pass call-count assertions stay stable; fetch tests opt in explicitly.
+  consistency scoring `## PASS: scoring-consistency` / planner `## PASS: context`). **Beware
+  `## PASS: scoring` is a substring of `## PASS: scoring-consistency`** — insert the
+  consistency key first in the `responses` dict so the specific one wins. `make_config` defaults
+  `fetch_referenced_context` **off** AND pins `lenses` to the original **4** (not `LENS_NAMES`,
+  which now includes `consistency`) so existing multi-pass call-count assertions stay stable;
+  fetch/consistency tests opt in explicitly (`fetch_conventions`, `lenses=(…,"consistency")`).
   `FakeGhClient.search_code` / `get_file_content` are keyed by query/path with a `"*"` catch-all.
 - Under the parallel pipeline, **assert call counts/sets, never order** (the fake's counter
   is lock-guarded; `calls_matching(substr)` helps).
