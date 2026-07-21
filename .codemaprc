@@ -1,0 +1,33 @@
+{
+  "include": [
+    "."
+  ],
+  "exclude": [
+    "node_modules",
+    "__pycache__",
+    "dist",
+    "build",
+    "lib",
+    ".git",
+    ".codemap",
+    "*.test.*",
+    "*.spec.*",
+    "*.min.*",
+    "coverage",
+    "vendor",
+    ".next",
+    ".nuxt",
+    "venv",
+    ".venv",
+    "env",
+    ".env",
+    ".tox",
+    "eggs",
+    "*.egg-info",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "site-packages",
+    "migrations"
+  ]
+}

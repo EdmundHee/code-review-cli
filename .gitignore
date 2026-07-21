@@ -19,3 +19,8 @@ secrets.*
 
 # Logs
 *.log
+
+# OS / editor / tooling junk
+.DS_Store
+.codemap/
+config-bk.yaml
