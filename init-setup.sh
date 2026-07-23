@@ -11,18 +11,29 @@ SECRETS_DIR="$HOME/.config/ghcr"
 SECRETS_FILE="$SECRETS_DIR/secrets.env"
 
 echo "==> Python venv"
+# Interpreter is explicit, not ambient. Honors .python-version (pyenv shim);
+# override with: PYTHON=/path/to/python3 bash init-setup.sh
+PYTHON="${PYTHON:-python3}"
 if [[ ! -d .venv ]]; then
-  python3 -m venv .venv
-  echo "    created .venv"
+  "$PYTHON" -m venv .venv || { echo "ERROR: venv creation failed with '$PYTHON'." >&2; exit 1; }
+  echo "    created .venv ($("$PYTHON" --version 2>&1))"
 else
   echo "    .venv exists"
 fi
-# shellcheck disable=SC1091
-source .venv/bin/activate
+VENV_PY=".venv/bin/python"
+# Fail fast if the venv's Python has a broken stdlib (e.g. Homebrew 3.14 pyexpat/
+# expat symbol mismatch). Catches a broken base interpreter AND a stale bad .venv.
+if ! "$VENV_PY" -c "import pyexpat" 2>/dev/null; then
+  echo "ERROR: .venv Python broken (pyexpat won't load) — built on a broken interpreter" >&2
+  echo "       (e.g. Homebrew 3.14 expat mismatch). Fix:" >&2
+  echo "         pyenv local 3.12.1   # or: PYTHON=/path/to/good/python3" >&2
+  echo "         rm -rf .venv && bash init-setup.sh" >&2
+  exit 1
+fi
 
 echo "==> Installing ghcr + dev deps"
-pip install -q --upgrade pip || true
-pip install -q -e ".[dev]"
+"$VENV_PY" -m pip install -q --upgrade pip || true
+"$VENV_PY" -m pip install -q -e ".[dev]"
 
 echo "==> config.yaml"
 if [[ ! -f config.yaml ]]; then
@@ -49,7 +60,7 @@ else
 fi
 
 echo "==> Running tests"
-python -m pytest -q
+"$VENV_PY" -m pytest -q
 
 cat <<EOF
 
