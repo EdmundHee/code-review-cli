@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import logging
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -85,6 +86,9 @@ def _build(cfg: Config, bus=None):
 def _acquire_lock(db_path: str):
     """Single-instance guard: exclusive flock on a lockfile beside the DB."""
     lock_path = db_path + ".lock"
+    parent = os.path.dirname(lock_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     fh = open(lock_path, "w")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
